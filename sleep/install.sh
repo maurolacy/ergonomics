@@ -257,6 +257,9 @@ cat > "$WORKFLOW_DIR/document.wflow" << 'WFLOW'
 </plist>
 WFLOW
 
+# Flush the pasteboard server cache so macOS discovers the new service
+/System/Library/CoreServices/pbs -flush 2>/dev/null || true
+
 echo "Installed SleepMac.workflow to ~/Library/Services/"
 echo ""
 echo "To assign a keyboard shortcut:"
