@@ -132,8 +132,8 @@ def set_status(emoji):
     click(px + DONE_BTN_OFFSET[0], py + DONE_BTN_OFFSET[1])
     time.sleep(0.5)
 
-    # 5. Dismiss the flyout by clicking on the main Teams area
-    click(wx + ww // 2, wy + wh // 2)
+    # 5. Dismiss the flyout by clicking the profile icon again
+    click(px, py)
     time.sleep(0.3)
 
     print(f"Status set to {emoji}")
@@ -170,8 +170,8 @@ def clear_status():
     click(px + DONE_BTN_OFFSET[0], py + DONE_BTN_OFFSET[1])
     time.sleep(0.5)
 
-    # 5. Dismiss the flyout
-    click(wx + ww // 2, wy + wh // 2)
+    # 5. Dismiss the flyout by clicking the profile icon again
+    click(px, py)
     time.sleep(0.3)
 
     print("Status cleared")
