@@ -144,7 +144,14 @@ def cmd_a():
 
 
 def set_status(emoji):
-    """Set Teams status message to the given emoji."""
+    """Set Teams status message to the given emoji.
+
+    Clears any existing status first so the flow is always consistent.
+    """
+    # Clear existing status (no-op if none set)
+    clear_status(quiet=True)
+    time.sleep(0.5)
+
     wx, wy, ww, wh = get_teams_window()
     px = wx + PROFILE_OFFSET[0]
     py = wy + PROFILE_OFFSET[1]
@@ -159,11 +166,9 @@ def set_status(emoji):
     click(px + STATUS_MSG_OFFSET[0], py + STATUS_MSG_OFFSET[1])
     time.sleep(1.5)
 
-    # 3. Select all (clear any existing text) and type the emoji
+    # 3. Paste the emoji into the (empty) status field
     activate_teams()
     time.sleep(0.3)
-    cmd_a()
-    time.sleep(0.2)
     paste_text(emoji)
     time.sleep(1.0)
 
@@ -178,8 +183,11 @@ def set_status(emoji):
     print(f"Status set to {emoji}")
 
 
-def clear_status():
-    """Clear Teams status message by hovering to reveal the delete icon, then clicking it."""
+def clear_status(quiet=False):
+    """Clear Teams status message by hovering to reveal the delete icon, then clicking it.
+
+    If no status is set, the hover/click lands harmlessly and the flyout is dismissed.
+    """
     wx, wy, ww, wh = get_teams_window()
     px = wx + PROFILE_OFFSET[0]
     py = wy + PROFILE_OFFSET[1]
@@ -210,7 +218,8 @@ def clear_status():
     click(px, py)
     time.sleep(0.3)
 
-    print("Status cleared")
+    if not quiet:
+        print("Status cleared")
 
 
 def main():
