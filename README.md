@@ -83,6 +83,11 @@ ln -s "$(pwd)/out_for_a_walk" /usr/local/bin/out_for_a_walk
   reliable automation path is CGEvent mouse clicks at known pixel offsets.
   It's ugly, but it works.
 
+## Authors
+
+- **Mauro Lacy**
+- **Claude Opus 4.6**
+
 ## License
 
 MIT
