@@ -45,12 +45,36 @@ DONE_BTN_OFFSET = (-30, 520)     # Done button (status_msg + (50, 280))
 
 
 def get_teams_window():
-    """Get Teams window position and size. Also activates Teams."""
+    """Get Teams window position and size.
+
+    Launches Teams if not running, unminimizes if needed, and brings to front.
+    """
     script = '''
-    tell application "Microsoft Teams" to activate
-    delay 0.5
+    if application "Microsoft Teams" is not running then
+        tell application "Microsoft Teams" to activate
+        delay 3
+    else
+        tell application "Microsoft Teams" to activate
+        delay 0.5
+    end if
     tell application "System Events"
         tell process "Microsoft Teams"
+            -- Wait for a window to appear (Teams may need time after activate)
+            set retries to 0
+            repeat while (count of windows) is 0 and retries < 10
+                tell application "Microsoft Teams" to reopen
+                tell application "Microsoft Teams" to activate
+                delay 1
+                set retries to retries + 1
+            end repeat
+            if (count of windows) is 0 then
+                error "No Teams window found after waiting. Please open Teams first."
+            end if
+            -- Unminimize if needed
+            if value of attribute "AXMinimized" of window 1 is true then
+                set value of attribute "AXMinimized" of window 1 to false
+                delay 0.5
+            end if
             set winPos to position of window 1
             set winSize to size of window 1
             return ((item 1 of winPos) as string) & "," & ((item 2 of winPos) as string) & "," & ((item 1 of winSize) as string) & "," & ((item 2 of winSize) as string)
@@ -58,6 +82,9 @@ def get_teams_window():
     end tell
     '''
     result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error: {result.stderr.strip()}")
+        raise SystemExit(1)
     parts = [p.strip() for p in result.stdout.strip().split(",")]
     return int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
 
