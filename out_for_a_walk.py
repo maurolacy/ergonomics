@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Set your Microsoft Teams status message to a random walking emoji.
 
-Uses CGEvent mouse clicks and clipboard paste to drive the Teams UI.
-No API auth needed — works entirely through UI automation.
+Uses CGEvent mouse clicks and keyboard events to drive the Teams UI.
+No API auth needed, no clipboard usage — works entirely through UI automation.
 
 Usage:
     ./out_for_a_walk          # set walking status
@@ -86,15 +86,23 @@ def click(x, y):
     CGEventPost(kCGHIDEventTap, event)
 
 
-def cmd_v():
-    """Send Cmd+V (paste) via CGEvent."""
-    event = CGEventCreateKeyboardEvent(None, 9, True)  # V key down
+def paste_text(text):
+    """Paste text into the focused field, preserving the user's clipboard."""
+    # Save current clipboard
+    saved = subprocess.run(["pbpaste"], capture_output=True)
+    # Set our text
+    subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+    # Cmd+V
+    event = CGEventCreateKeyboardEvent(None, 9, True)
     CGEventSetFlags(event, kCGEventFlagMaskCommand)
     CGEventPost(kCGHIDEventTap, event)
     time.sleep(0.05)
-    event = CGEventCreateKeyboardEvent(None, 9, False)  # V key up
+    event = CGEventCreateKeyboardEvent(None, 9, False)
     CGEventSetFlags(event, kCGEventFlagMaskCommand)
     CGEventPost(kCGHIDEventTap, event)
+    time.sleep(0.3)
+    # Restore clipboard
+    subprocess.run(["pbcopy"], input=saved.stdout, check=True)
 
 
 def cmd_a():
@@ -114,25 +122,22 @@ def set_status(emoji):
     px = wx + PROFILE_OFFSET[0]
     py = wy + PROFILE_OFFSET[1]
 
-    # Put emoji on clipboard
-    subprocess.run(["pbcopy"], input=emoji.encode("utf-8"), check=True)
-
     # 1. Click profile icon
     activate_teams()
     time.sleep(0.5)
     click(px, py)
     time.sleep(1.5)
 
-    # 2. Click "Set status message"
+    # 2. Click "Set status message" / existing status area
     click(px + STATUS_MSG_OFFSET[0], py + STATUS_MSG_OFFSET[1])
     time.sleep(1.5)
 
-    # 3. Select all (clear any existing text) and paste emoji
+    # 3. Select all (clear any existing text) and type the emoji
     activate_teams()
     time.sleep(0.3)
     cmd_a()
     time.sleep(0.2)
-    cmd_v()
+    paste_text(emoji)
     time.sleep(1.0)
 
     # 4. Click Done
