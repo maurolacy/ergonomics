@@ -23,6 +23,7 @@ from Quartz import (
     CGPointMake,
     kCGEventLeftMouseDown,
     kCGEventLeftMouseUp,
+    kCGEventMouseMoved,
     kCGEventFlagMaskCommand,
     kCGHIDEventTap,
     kCGMouseButtonLeft,
@@ -67,6 +68,13 @@ def activate_teams():
         "osascript", "-e",
         'tell application "Microsoft Teams" to activate'
     ], capture_output=True)
+
+
+def hover(x, y):
+    """Move the mouse to screen coordinates (triggers hover effects)."""
+    point = CGPointMake(x, y)
+    event = CGEventCreateMouseEvent(None, kCGEventMouseMoved, point, kCGMouseButtonLeft)
+    CGEventPost(kCGHIDEventTap, event)
 
 
 def click(x, y):
@@ -140,37 +148,34 @@ def set_status(emoji):
 
 
 def clear_status():
-    """Clear Teams status message by setting it to empty."""
+    """Clear Teams status message by hovering to reveal the delete icon, then clicking it."""
     wx, wy, ww, wh = get_teams_window()
     px = wx + PROFILE_OFFSET[0]
     py = wy + PROFILE_OFFSET[1]
 
-    # Put empty string on clipboard
-    subprocess.run(["pbcopy"], input=b"", check=True)
+    # Status message area (same position as "Set status message" link)
+    status_x = px + STATUS_MSG_OFFSET[0]
+    status_y = py + STATUS_MSG_OFFSET[1]
 
-    # 1. Click profile icon
+    # 1. Click profile icon to open flyout
     activate_teams()
     time.sleep(0.5)
     click(px, py)
     time.sleep(1.5)
 
-    # 2. Click "Set status message"
-    click(px + STATUS_MSG_OFFSET[0], py + STATUS_MSG_OFFSET[1])
-    time.sleep(1.5)
+    # 2. Hover over the status message area to reveal the delete icon
+    hover(status_x, status_y)
+    time.sleep(0.8)
 
-    # 3. Select all and delete (paste empty)
-    activate_teams()
+    # 3. Click the delete icon (bottom-right of the status text area)
+    delete_x = status_x + 90
+    delete_y = status_y + 20
+    hover(delete_x, delete_y)
     time.sleep(0.3)
-    cmd_a()
-    time.sleep(0.2)
-    cmd_v()
-    time.sleep(1.0)
+    click(delete_x, delete_y)
+    time.sleep(0.8)
 
-    # 4. Click Done
-    click(px + DONE_BTN_OFFSET[0], py + DONE_BTN_OFFSET[1])
-    time.sleep(0.5)
-
-    # 5. Dismiss the flyout by clicking the profile icon again
+    # 4. Dismiss the flyout by clicking the profile icon again
     click(px, py)
     time.sleep(0.3)
 
