@@ -12,7 +12,6 @@ Usage:
 import argparse
 import random
 import subprocess
-import sys
 import time
 
 from Quartz import (
