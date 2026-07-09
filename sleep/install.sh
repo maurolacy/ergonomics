@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Install the SleepMac Quick Action.
+# Install the Sleep Quick Action.
 #
 # Creates a macOS Automator Quick Action (Service) that puts the Mac to sleep.
 # After running this script, assign a keyboard shortcut via:
-#   System Settings > Keyboard > Keyboard Shortcuts > Services > SleepMac
+#   System Settings > Keyboard > Keyboard Shortcuts > Services > Sleep
 set -euo pipefail
 
-WORKFLOW_DIR="$HOME/Library/Services/SleepMac.workflow/Contents"
+WORKFLOW_DIR="$HOME/Library/Services/Sleep.workflow/Contents"
 
-if [ -d "$HOME/Library/Services/SleepMac.workflow" ]; then
-    echo "SleepMac.workflow already exists. Skipping."
+if [ -d "$HOME/Library/Services/Sleep.workflow" ]; then
+    echo "Sleep.workflow already exists. Skipping."
     exit 0
 fi
 
-echo "Creating SleepMac Quick Action..."
+echo "Creating Sleep Quick Action..."
 mkdir -p "$WORKFLOW_DIR"
 
 cat > "$WORKFLOW_DIR/Info.plist" << 'PLIST'
@@ -31,7 +31,7 @@ cat > "$WORKFLOW_DIR/Info.plist" << 'PLIST'
 			<key>NSMenuItem</key>
 			<dict>
 				<key>default</key>
-				<string>SleepMac</string>
+				<string>Sleep</string>
 			</dict>
 			<key>NSMessage</key>
 			<string>runWorkflowAsService</string>
@@ -260,9 +260,9 @@ WFLOW
 # Flush the pasteboard server cache so macOS discovers the new service
 /System/Library/CoreServices/pbs -flush 2>/dev/null || true
 
-echo "Installed SleepMac.workflow to ~/Library/Services/"
+echo "Installed Sleep.workflow to ~/Library/Services/"
 echo ""
 echo "To assign a keyboard shortcut:"
 echo "  1. Open System Settings > Keyboard > Keyboard Shortcuts > Services"
-echo "  2. Find 'SleepMac' under General"
+echo "  2. Find 'Sleep' under General"
 echo "  3. Double-click the shortcut area and press your desired key combo"

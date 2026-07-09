@@ -5,7 +5,7 @@ Microsoft forgot (or refused) to make easy.
 
 ## Tools
 
-### 1. SleepMac - Sleep keyboard shortcut
+### 1. Sleep - Sleep keyboard shortcut
 
 macOS has no built-in keyboard shortcut to put the machine to sleep.
 This installs an Automator Quick Action that you can bind to any key combo.
@@ -19,7 +19,7 @@ This installs an Automator Quick Action that you can bind to any key combo.
 **Then assign a keyboard shortcut:**
 
 1. Open **System Settings > Keyboard > Keyboard Shortcuts > Services**
-2. Find **SleepMac** under General
+2. Find **Sleep** under General
 3. Double-click the shortcut area and press your desired combo (e.g. `Ctrl+Option+S`)
 
 ### 2. out_for_a_walk - Teams walking status
@@ -41,6 +41,8 @@ emoji, and clicks Done. Your clipboard is saved and restored.
 **Install:**
 
 ```bash
+cd walk
+
 # Set up the Python virtual environment
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
@@ -70,7 +72,7 @@ ln -s "$(pwd)/out_for_a_walk" /usr/local/bin/out_for_a_walk
 
 ## Why does this exist?
 
-- **SleepMac:** Apple provides no native keyboard shortcut to sleep.
+- **Sleep:** Apple provides no native keyboard shortcut to sleep.
   `Cmd+Option+Power` only sleeps the display. Creating a Quick Action and
   binding it to a shortcut is the only native-only solution.
 
