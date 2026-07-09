@@ -20,7 +20,7 @@ This installs an Automator Quick Action that you can bind to any key combo.
 
 1. Open **System Settings > Keyboard > Keyboard Shortcuts > Services**
 2. Find **Sleep** under General
-3. Double-click the shortcut area and press your desired combo (e.g. `Ctrl+Option+S`)
+3. Double-click the shortcut area and press `Ctrl+Option+S` (or your preferred combo)
 
 ### 2. out_for_a_walk - Teams walking status
 
