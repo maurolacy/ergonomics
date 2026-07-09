@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Set Teams status to a walking emoji via UI automation.
+# Usage: ./out_for_a_walk [--clear]
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export PYTHONUNBUFFERED=1
+exec "$SCRIPT_DIR/.venv/bin/python3" "$SCRIPT_DIR/out_for_a_walk.py" "$@"
