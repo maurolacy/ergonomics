@@ -76,6 +76,7 @@ A curated collection of bash aliases for git, cargo, and everyday commands,
 with a sync tool to keep your local aliases and the repo in step.
 
 Includes 120+ aliases, bug-fixed and macOS-compatible.
+See the [cheatsheet](aliases/CHEATSHEET.md) for a quick reference.
 
 **Install (new machine):**
 
