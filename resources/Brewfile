@@ -2,25 +2,40 @@
 brew "coreutils"
 brew "findutils"
 brew "gnu-sed"
+brew "gnu-tar"
 brew "gnu-units"
 brew "gnu-getopt"
+brew "gawk"
 brew "make"
 brew "grep"
+brew "less"
 
 # Git
 brew "git"
 brew "gh"
+brew "git-delta"
 
 # Shell
 brew "bash"
 brew "bash-completion@2"
+brew "shellcheck"
+brew "tmux"
 
-# Search
+# Search & navigation
 brew "ripgrep"
+brew "fd"
+brew "fzf"
 brew "jq"
+brew "yq"
 
 # Node
 brew "nvm"
+
+# Better defaults
+brew "bat"
+brew "eza"
+brew "htop"
+brew "tldr"
 
 # Essentials
 brew "wget"
@@ -28,3 +43,4 @@ brew "tree"
 brew "watch"
 brew "bc"
 brew "vim"
+brew "gnupg"

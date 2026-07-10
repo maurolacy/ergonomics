@@ -100,9 +100,13 @@ spend two hours making the terminal not terrible.
 
 **What it installs:**
 
-- GNU coreutils, findutils, sed, make, getopt, units, grep
-- git, gh, ripgrep, jq, wget, tree, watch, vim, bc
-- bash + bash-completion, nvm
+- GNU coreutils, findutils, sed, tar, units, getopt, awk, make, grep, less
+- git, gh, git-delta (side-by-side diffs)
+- bash, bash-completion, shellcheck, tmux
+- ripgrep, fd, fzf (Ctrl+R history search), jq, yq
+- bat (syntax-highlighted cat), eza (modern ls), htop, tldr
+- wget, tree, watch, bc, vim, gnupg
+- nvm (Node version manager)
 
 **Install:**
 

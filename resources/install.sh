@@ -55,6 +55,15 @@ ${SOURCE_LINE}" "$BASHRC"
     fi
 fi
 
+# Configure git-delta as the default pager (one-time)
+if command -v delta &>/dev/null; then
+    git config --global core.pager delta
+    git config --global interactive.diffFilter "delta --color-only"
+    git config --global delta.navigate true
+    git config --global delta.side-by-side true
+    echo "Configured git to use delta for diffs."
+fi
+
 echo ""
 echo "Done. Restart your shell or run:"
 echo "  source ~/.bashrc"
