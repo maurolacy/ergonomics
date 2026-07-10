@@ -31,11 +31,6 @@ if command -v brew &>/dev/null; then
     # Bash completion
     [ -f "$BREW_PREFIX/etc/bash_completion" ] && . "$BREW_PREFIX/etc/bash_completion"
 
-    # NVM
-    export NVM_DIR="$HOME/.nvm"
-    [ -s "$BREW_PREFIX/opt/nvm/nvm.sh" ] && . "$BREW_PREFIX/opt/nvm/nvm.sh"
-    [ -s "$BREW_PREFIX/opt/nvm/etc/bash_completion.d/nvm" ] && . "$BREW_PREFIX/opt/nvm/etc/bash_completion.d/nvm"
-
     # fzf key bindings (Ctrl+R history, Ctrl+T file finder, Alt+C cd)
     eval "$(fzf --bash 2>/dev/null)" || {
         [ -f "$BREW_PREFIX/opt/fzf/shell/key-bindings.bash" ] && . "$BREW_PREFIX/opt/fzf/shell/key-bindings.bash"

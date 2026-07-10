@@ -28,9 +28,6 @@ brew "fzf"
 brew "jq"
 brew "yq"
 
-# Node
-brew "nvm"
-
 # Better defaults
 brew "bat"
 brew "eza"

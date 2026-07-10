@@ -106,7 +106,6 @@ spend two hours making the terminal not terrible.
 - ripgrep, fd, fzf (Ctrl+R history search), jq, yq
 - bat (syntax-highlighted cat), eza (modern ls), htop, tldr
 - wget, tree, watch, bc, vim, gnupg
-- nvm (Node version manager)
 
 **Install:**
 
