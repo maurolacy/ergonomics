@@ -24,17 +24,35 @@ echo ""
 echo "Packages installed."
 
 # Configure .bashrc to source bashrc_base
+COMMENT="# ergonomics: portable shell config (history, prompt, GNU utils, aliases, completions)"
 if [ ! -f "$BASHRC" ]; then
     echo "Creating ~/.bashrc..."
-    echo "$SOURCE_LINE" > "$BASHRC"
+    printf '%s\n%s\n' "$COMMENT" "$SOURCE_LINE" > "$BASHRC"
     echo "Created ~/.bashrc with ergonomics config."
 elif grep -qF "bashrc_base" "$BASHRC"; then
     echo "~/.bashrc already sources bashrc_base. Skipping."
 else
-    echo "" >> "$BASHRC"
-    echo "# ergonomics: portable shell config" >> "$BASHRC"
-    echo "$SOURCE_LINE" >> "$BASHRC"
-    echo "Added ergonomics config to ~/.bashrc."
+    # Insert after the interactivity guard (case $- in ... esac), if present.
+    # This ensures portable config loads before machine-specific customizations.
+    GUARD_LINE=$(awk '/^case \$- in/{found=1} found && /^esac$/{print NR; exit}' "$BASHRC")
+    if [ -n "$GUARD_LINE" ]; then
+        sed -i.tmp "${GUARD_LINE}a\\
+\\
+${COMMENT}\\
+${SOURCE_LINE}" "$BASHRC"
+        rm -f "$BASHRC.tmp"
+        echo "Added ergonomics config to ~/.bashrc (after interactivity guard, line $GUARD_LINE)."
+    else
+        # No guard found — prepend after any leading comments
+        FIRST_CODE=$(awk '/^[^#]/ && !/^$/ {print NR; exit}' "$BASHRC")
+        FIRST_CODE="${FIRST_CODE:-1}"
+        sed -i.tmp "$((FIRST_CODE - 1))a\\
+\\
+${COMMENT}\\
+${SOURCE_LINE}" "$BASHRC"
+        rm -f "$BASHRC.tmp"
+        echo "Added ergonomics config to ~/.bashrc (line $FIRST_CODE)."
+    fi
 fi
 
 echo ""
