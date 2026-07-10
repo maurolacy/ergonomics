@@ -55,6 +55,19 @@ ${SOURCE_LINE}" "$BASHRC"
     fi
 fi
 
+# Ensure ~/.bash_profile sources ~/.bashrc (macOS starts login shells)
+BASH_PROFILE="$HOME/.bash_profile"
+BASHRC_SOURCE='[ -f ~/.bashrc ] && . ~/.bashrc'
+if [ ! -f "$BASH_PROFILE" ]; then
+    echo "$BASHRC_SOURCE" > "$BASH_PROFILE"
+    echo "Created ~/.bash_profile (sources ~/.bashrc)."
+elif ! grep -qF '.bashrc' "$BASH_PROFILE"; then
+    echo "" >> "$BASH_PROFILE"
+    echo "# Source .bashrc for interactive config" >> "$BASH_PROFILE"
+    echo "$BASHRC_SOURCE" >> "$BASH_PROFILE"
+    echo "Added .bashrc sourcing to ~/.bash_profile."
+fi
+
 # Configure git-delta as the default pager (one-time)
 if command -v delta &>/dev/null; then
     git config --global core.pager delta
