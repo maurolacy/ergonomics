@@ -1,0 +1,30 @@
+# GNU utils — replace macOS BSD variants with GNU equivalents
+brew "coreutils"
+brew "findutils"
+brew "gnu-sed"
+brew "gnu-units"
+brew "gnu-getopt"
+brew "make"
+brew "grep"
+
+# Git
+brew "git"
+brew "gh"
+
+# Shell
+brew "bash"
+brew "bash-completion@2"
+
+# Search
+brew "ripgrep"
+brew "jq"
+
+# Node
+brew "nvm"
+
+# Essentials
+brew "wget"
+brew "tree"
+brew "watch"
+brew "bc"
+brew "vim"

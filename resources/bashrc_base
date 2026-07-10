@@ -1,0 +1,61 @@
+# ergonomics: portable shell config
+# Source this from your ~/.bashrc:
+#   [ -f ~/Projects/ergonomics/resources/bashrc_base ] && . ~/Projects/ergonomics/resources/bashrc_base
+
+# --- History ---
+HISTCONTROL=ignoreboth
+shopt -s histappend
+HISTSIZE=100000
+HISTFILESIZE=2000000
+
+# --- Shell options ---
+shopt -s checkwinsize
+
+# --- Locale ---
+export LANG="en_US.UTF-8"
+export EDITOR=vim
+
+# --- Prompt ---
+case "$TERM" in
+    xterm-color|*-256color) color_prompt=yes;;
+esac
+if [ "$color_prompt" = yes ]; then
+    PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+else
+    PS1='\u@\h:\w\$ '
+fi
+unset color_prompt
+case "$TERM" in
+    xterm*|rxvt*) PS1="\[\e]0;\u@\h: \w\a\]$PS1";;
+esac
+
+# --- GNU utils (Homebrew) ---
+if command -v brew &>/dev/null; then
+    BREW_PREFIX="$(brew --prefix)"
+    for pkg in coreutils findutils gnu-sed gnu-units make; do
+        gnubin="$BREW_PREFIX/opt/$pkg/libexec/gnubin"
+        [ -d "$gnubin" ] && export PATH="$gnubin:$PATH"
+    done
+    for pkg in gnu-getopt git; do
+        bindir="$BREW_PREFIX/opt/$pkg/bin"
+        [ -d "$bindir" ] && export PATH="$bindir:$PATH"
+    done
+    unset gnubin bindir pkg
+
+    # Bash completion
+    [ -f "$BREW_PREFIX/etc/bash_completion" ] && . "$BREW_PREFIX/etc/bash_completion"
+
+    # NVM
+    export NVM_DIR="$HOME/.nvm"
+    [ -s "$BREW_PREFIX/opt/nvm/nvm.sh" ] && . "$BREW_PREFIX/opt/nvm/nvm.sh"
+    [ -s "$BREW_PREFIX/opt/nvm/etc/bash_completion.d/nvm" ] && . "$BREW_PREFIX/opt/nvm/etc/bash_completion.d/nvm"
+
+    unset BREW_PREFIX
+fi
+
+# --- Aliases ---
+[ -f ~/.bash_aliases ] && . ~/.bash_aliases
+
+# --- Utilities ---
+# Decompress raw zlib streams
+zlipd() (printf "\x1f\x8b\x08\x00\x00\x00" | cat - "$@" | gzip -dc)

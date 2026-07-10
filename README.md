@@ -92,6 +92,33 @@ source ~/.bash_aliases   # activate immediately
 ./aliases/sync.sh push   # push local changes into the repo
 ```
 
+### 4. resources - Dev environment bootstrap
+
+Installs GNU utils and essential dev tools via Homebrew, and sets up a
+portable `.bashrc` config. Because the first thing you do on a new Mac is
+spend two hours making the terminal not terrible.
+
+**What it installs:**
+
+- GNU coreutils, findutils, sed, make, getopt, units, grep
+- git, gh, ripgrep, jq, wget, tree, watch, vim, bc
+- bash + bash-completion, nvm
+
+**Install:**
+
+```bash
+./resources/install.sh
+```
+
+This runs `brew bundle` with the included `Brewfile` and adds a single
+`source` line to your `~/.bashrc` that loads the portable config from
+`bashrc_base` (GNU utils PATH, prompt, history, completions, nvm).
+
+Machine-specific config (secrets, tokens, tool-specific paths) stays in
+your `~/.bashrc` — `bashrc_base` only manages the portable parts.
+
+**Prerequisites:** [Homebrew](https://brew.sh)
+
 ## Why does this exist?
 
 - **Sleep:** Apple provides no native keyboard shortcut to sleep.
