@@ -24,7 +24,7 @@ echo ""
 echo "Packages installed."
 
 # Configure .bashrc to source bashrc_base
-COMMENT="# ergonomics: portable shell config (history, prompt, GNU utils, aliases, completions)"
+COMMENT="# ergonomics: portable shell config (history, GNU utils, aliases, completions)"
 if [ ! -f "$BASHRC" ]; then
     echo "Creating ~/.bashrc..."
     printf '%s\n%s\n' "$COMMENT" "$SOURCE_LINE" > "$BASHRC"
