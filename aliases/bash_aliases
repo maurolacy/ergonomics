@@ -101,6 +101,14 @@ alias ll='ls -alF'
 alias la='ls -A'
 alias l='ls -CF'
 
+# macOS open helpers
+alias o='open .'
+alias preview='open -a Preview'
+alias chrome='open -a "Google Chrome"'
+alias safari='open -a Safari'
+alias act='open -a "Activity Monitor"'
+alias console='open -a Console'
+
 # gnu-locate for Mac
 alias updatedb='gupdatedb --localpaths="$HOME /usr/local /Applications"'
 alias locate='glocate'

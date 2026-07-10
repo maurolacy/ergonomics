@@ -40,6 +40,12 @@
 
 | Alias | Command | Notes |
 |-------|---------|-------|
+| `o` | `open .` | Open current directory in Finder |
+| `preview` | `open -a Preview` | Open files in Preview.app |
+| `chrome` | `open -a "Google Chrome"` | Open files/URLs in Chrome |
+| `safari` | `open -a Safari` | Open URLs in Safari |
+| `activity` | `open -a "Activity Monitor"` | Activity Monitor |
+| `console` | `open -a Console` | macOS system logs |
 | `ll` | `ls -alF` | `la` hidden, `l` compact |
 | `eq` | `bc -l <<<` | Quick math: `eq '2^10'` |
 | `make` | `make -j(ncpu-2)` | Parallel build, leaves 2 cores free |
