@@ -70,6 +70,28 @@ ln -s "$(pwd)/out_for_a_walk" /usr/local/bin/out_for_a_walk
 - Don't interact with the mouse while the script is clicking through the
   UI (~5 seconds).
 
+### 3. aliases - Bash alias manager
+
+A curated collection of bash aliases for git, cargo, and everyday commands,
+with a sync tool to keep your local aliases and the repo in step.
+
+Includes 120+ aliases, bug-fixed and macOS-compatible.
+
+**Install (new machine):**
+
+```bash
+./aliases/install.sh     # backs up ~/.bash_aliases, copies repo version
+source ~/.bash_aliases   # activate immediately
+```
+
+**Sync:**
+
+```bash
+./aliases/sync.sh        # show diff between local and repo
+./aliases/sync.sh pull   # pull repo changes into local
+./aliases/sync.sh push   # push local changes into the repo
+```
+
 ## Why does this exist?
 
 - **Sleep:** Apple provides no native keyboard shortcut to sleep.
