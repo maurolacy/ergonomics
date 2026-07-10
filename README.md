@@ -73,24 +73,30 @@ ln -s "$(pwd)/out_for_a_walk" /usr/local/bin/out_for_a_walk
 ### 3. aliases - Bash alias manager
 
 A curated collection of bash aliases for git, cargo, and everyday commands,
-with a sync tool to keep your local aliases and the repo in step.
+with a sync tool to keep the base aliases in step with the repo.
 
 Includes 120+ aliases, bug-fixed and macOS-compatible.
 See the [cheatsheet](aliases/CHEATSHEET.md) for a quick reference.
 
+**How it works:**
+
+- `~/.bash_aliases_base` — the portable base (synced with the repo)
+- `~/.bash_aliases` — sources the base, then holds your local/machine-specific aliases
+
 **Install (new machine):**
 
 ```bash
-./aliases/install.sh     # backs up ~/.bash_aliases, copies repo version
+./aliases/install.sh     # copies base to ~/.bash_aliases_base,
+                         # sets up ~/.bash_aliases to source it
 source ~/.bash_aliases   # activate immediately
 ```
 
 **Sync:**
 
 ```bash
-./aliases/sync.sh        # show diff between local and repo
-./aliases/sync.sh pull   # pull repo changes into local
-./aliases/sync.sh push   # push local changes into the repo
+./aliases/sync.sh        # show diff between local base and repo
+./aliases/sync.sh pull   # pull repo changes into local base
+./aliases/sync.sh push   # push local base changes into the repo
 ```
 
 ### 4. resources - Dev environment bootstrap

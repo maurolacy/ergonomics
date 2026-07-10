@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Bi-directional sync between ~/.bash_aliases and the repo copy.
+# Bi-directional sync between ~/.bash_aliases_base and the repo copy.
 #
 # Usage:
-#   ./sync.sh          show diff between local and repo
-#   ./sync.sh pull     pull repo changes into local ~/.bash_aliases
+#   ./sync.sh          show diff between local base and repo
+#   ./sync.sh pull     pull repo changes into local ~/.bash_aliases_base
 #   ./sync.sh push     push local changes into the repo
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$SCRIPT_DIR/bash_aliases"
-LOCAL="$HOME/.bash_aliases"
+LOCAL="$HOME/.bash_aliases_base"
 
 if [ ! -f "$REPO" ]; then
     echo "Error: repo aliases not found at $REPO"
@@ -17,7 +17,7 @@ if [ ! -f "$REPO" ]; then
 fi
 
 if [ ! -f "$LOCAL" ]; then
-    echo "No ~/.bash_aliases found. Run install.sh first."
+    echo "No ~/.bash_aliases_base found. Run install.sh first."
     exit 1
 fi
 
@@ -28,7 +28,7 @@ case "$ACTION" in
         if diff -q "$LOCAL" "$REPO" > /dev/null 2>&1; then
             echo "In sync. No differences."
         else
-            echo "Differences between local (~/.bash_aliases) and repo:"
+            echo "Differences between local (~/.bash_aliases_base) and repo:"
             echo ""
             diff --color=auto -u "$LOCAL" "$REPO" || true
             echo ""
@@ -41,17 +41,17 @@ case "$ACTION" in
             echo "Already in sync. Nothing to pull."
             exit 0
         fi
-        echo "Pulling repo changes into ~/.bash_aliases..."
+        echo "Pulling repo changes into ~/.bash_aliases_base..."
         echo ""
         diff --color=auto -u "$LOCAL" "$REPO" || true
         echo ""
         BACKUP="$LOCAL.bak.$(date +%Y%m%d%H%M%S)"
-        read -rp "Apply these changes to ~/.bash_aliases? (backup at $BACKUP) [y/N] " confirm
+        read -rp "Apply these changes to ~/.bash_aliases_base? (backup at $BACKUP) [y/N] " confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
             cp "$LOCAL" "$BACKUP"
             cp "$REPO" "$LOCAL"
             echo "Local updated from repo (backup: $BACKUP)"
-            echo "Run 'source ~/.bash_aliases' to activate."
+            echo "Run 'source ~/.bash_aliases' to activate (reloads base + local)."
         else
             echo "Aborted."
         fi
@@ -68,7 +68,7 @@ case "$ACTION" in
         read -rp "Apply these changes to the repo? [y/N] " confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
             cp "$LOCAL" "$REPO"
-            echo "Repo updated from ~/.bash_aliases"
+            echo "Repo updated from ~/.bash_aliases_base"
         else
             echo "Aborted."
         fi
@@ -77,8 +77,8 @@ case "$ACTION" in
         echo "Usage: $0 [diff|pull|push]"
         echo ""
         echo "  diff   show differences (default)"
-        echo "  pull   pull repo changes into local ~/.bash_aliases"
-        echo "  push   push local changes into the repo"
+        echo "  pull   pull repo changes into local ~/.bash_aliases_base"
+        echo "  push   push local ~/.bash_aliases_base changes into the repo"
         exit 1
         ;;
 esac
