@@ -41,6 +41,8 @@ WALKERS = [
 PROFILE_OFFSET = (987, 17)
 # Offsets relative to the profile icon position
 STATUS_MSG_OFFSET = (-80, 240)    # "Set status message" link
+TIMER_DROPDOWN_OFFSET = (-80, 470)  # "Clear status message after" dropdown
+TIMER_1H_OFFSET = (-500, 450)       # "1 hour" menu item (floating menu position)
 DONE_BTN_OFFSET = (-30, 520)     # Done button (status_msg + (50, 280))
 
 
@@ -172,7 +174,13 @@ def set_status(emoji):
     paste_text(emoji)
     time.sleep(1.0)
 
-    # 4. Click Done
+    # 4. Set "Clear status message after" to 1 hour
+    click(px + TIMER_DROPDOWN_OFFSET[0], py + TIMER_DROPDOWN_OFFSET[1])
+    time.sleep(0.5)
+    click(px + TIMER_1H_OFFSET[0], py + TIMER_1H_OFFSET[1])
+    time.sleep(0.5)
+
+    # 5. Click Done
     click(px + DONE_BTN_OFFSET[0], py + DONE_BTN_OFFSET[1])
     time.sleep(0.5)
 
