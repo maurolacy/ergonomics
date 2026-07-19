@@ -41,3 +41,6 @@ brew "watch"
 brew "bc"
 brew "vim"
 brew "gnupg"
+
+# Documents
+brew "pandoc"

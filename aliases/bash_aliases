@@ -108,6 +108,7 @@ alias chrome='open -a "Google Chrome"'
 alias safari='open -a Safari'
 alias act='open -a "Activity Monitor"'
 alias console='open -a Console'
+alias md2pdf='pandoc --pdf-engine=typst'
 
 # gnu-locate for Mac
 alias updatedb='gupdatedb --localpaths="$HOME /usr/local /Applications"'
