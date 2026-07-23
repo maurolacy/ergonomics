@@ -42,7 +42,6 @@ PROFILE_OFFSET = (987, 17)
 # Offsets relative to the profile icon position
 STATUS_MSG_OFFSET = (-80, 240)    # "Set status message" link
 TIMER_DROPDOWN_OFFSET = (-80, 470)  # "Clear status message after" dropdown
-TIMER_1H_OFFSET = (-500, 450)       # "1 hour" menu item (floating menu position)
 DONE_BTN_OFFSET = (-30, 520)     # Done button (status_msg + (50, 280))
 
 
@@ -134,6 +133,15 @@ def paste_text(text):
     subprocess.run(["pbcopy"], input=saved.stdout, check=True)
 
 
+def key_press(keycode):
+    """Send a single key press via CGEvent."""
+    event = CGEventCreateKeyboardEvent(None, keycode, True)
+    CGEventPost(kCGHIDEventTap, event)
+    time.sleep(0.05)
+    event = CGEventCreateKeyboardEvent(None, keycode, False)
+    CGEventPost(kCGHIDEventTap, event)
+
+
 def cmd_a():
     """Send Cmd+A (select all) via CGEvent."""
     event = CGEventCreateKeyboardEvent(None, 0, True)  # A key down
@@ -177,7 +185,9 @@ def set_status(emoji):
     # 4. Set "Clear status message after" to 1 hour
     click(px + TIMER_DROPDOWN_OFFSET[0], py + TIMER_DROPDOWN_OFFSET[1])
     time.sleep(0.5)
-    click(px + TIMER_1H_OFFSET[0], py + TIMER_1H_OFFSET[1])
+    key_press(18)   # '1' — type-ahead selects "1 hour"
+    time.sleep(0.3)
+    key_press(36)   # Enter — confirm selection
     time.sleep(0.5)
 
     # 5. Click Done
