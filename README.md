@@ -133,12 +133,45 @@ ai-conversations export -o exported/          # export all to markdown
 **Install:**
 
 ```bash
-./ai-tools/install.sh    # symlinks to /usr/local/bin/ai-conversations
+./ai-tools/install.sh    # symlinks ai-conversations and ai-costs to /usr/local/bin
 ```
 
 **Prerequisites:** Python 3.10+, no external dependencies (stdlib only)
 
-### 5. resources - Dev environment bootstrap
+### 5. ai-costs - Token usage & cost estimates
+
+Reports token usage and USD cost across AI coding agents. Claude Code costs
+are real (from logs or calculated at API rates). Cursor is subscription-based,
+so the tool reports tokens and a **counterfactual** estimate: what those
+tokens would have cost under public API pricing — especially useful when
+running Claude models through Cursor.
+
+**Supported backends:** Cursor, Claude Code, Devin (stub)
+
+```
+ai-costs                                  # daily report, all sources
+ai-costs daily --source cursor            # Cursor estimated API cost
+ai-costs monthly -b                       # monthly with per-model breakdown
+ai-costs session --source claude          # per-session (Claude Code)
+ai-costs daily --default-model claude-sonnet-4-6   # assume Cursor "default"
+ai-costs daily --since 2026-07-01 --json
+ai-costs daily --offline                  # embedded pricing only
+```
+
+**Cost markers:**
+
+- unmarked — actual cost from Claude Code logs
+- `~` — estimated / counterfactual API cost (Cursor)
+- `?` — model has no known public API price (e.g. `composer-*`)
+
+**Caveat:** Recent Cursor versions stopped writing per-message token counts.
+For those chats the tool falls back to context-window snapshots, which
+undercount real cumulative usage.
+
+**Prerequisites:** Python 3.10+, no external dependencies (stdlib only).
+Live pricing is fetched from LiteLLM unless `--offline` is set.
+
+### 6. resources - Dev environment bootstrap
 
 Installs GNU utils and essential dev tools via Homebrew, and sets up a
 portable `.bashrc` config. Because the first thing you do on a new Mac is
@@ -182,6 +215,11 @@ your `~/.bashrc` — `bashrc_base` only manages the portable parts.
   wraps all three behind a single interface so you can search, export, and
   own your conversation history regardless of which tool you used or what
   the vendor decides to ship next.
+
+- **ai-costs:** Claude Code bills per token; Cursor is a flat subscription
+  that hides real usage economics. This tool surfaces tokens for both and
+  estimates what Cursor usage would cost under API pricing — so you can
+  answer "am I getting my money's worth?" when running Claude through Cursor.
 
 - **out_for_a_walk:** Microsoft's Conditional Access policies block API
   access via the Graph API device code flow from unmanaged devices

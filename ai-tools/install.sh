@@ -2,7 +2,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TARGET="/usr/local/bin/ai-conversations"
 
-ln -sf "$SCRIPT_DIR/ai-conversations" "$TARGET"
-echo "Linked: $TARGET -> $SCRIPT_DIR/ai-conversations"
+for tool in ai-conversations ai-costs; do
+  target="/usr/local/bin/$tool"
+  ln -sf "$SCRIPT_DIR/$tool" "$target"
+  echo "Linked: $target -> $SCRIPT_DIR/$tool"
+done
