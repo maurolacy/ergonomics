@@ -171,6 +171,12 @@ undercount real cumulative usage.
 **Prerequisites:** Python 3.10+, no external dependencies (stdlib only).
 Live pricing is fetched from LiteLLM unless `--offline` is set.
 
+**Credits:** Claude Code log layout, report shapes (daily / monthly / session),
+cache-token handling, and LiteLLM-backed pricing ideas come from
+[ccusage](https://github.com/ccusage/ccusage) by [@ryoppippi](https://github.com/ryoppippi)
+and contributors. `ai-costs` is a separate Python tool with Cursor / Devin
+support and counterfactual Cursor API-cost estimates — not a fork.
+
 ### 6. resources - Dev environment bootstrap
 
 Installs GNU utils and essential dev tools via Homebrew, and sets up a
