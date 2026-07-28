@@ -130,6 +130,12 @@ ai-conversations export -o exported/          # export all to markdown
 - Exported markdown includes thinking in `<details>` blocks, tool calls, and results
 - `--source cursor|devin|claude` to restrict scope
 
+**Install:**
+
+```bash
+./ai-tools/install.sh    # symlinks to /usr/local/bin/ai-conversations
+```
+
 **Prerequisites:** Python 3.10+, no external dependencies (stdlib only)
 
 ### 5. resources - Dev environment bootstrap
