@@ -1,0 +1,1406 @@
+#!/usr/bin/env python3
+"""Search, list, and export AI coding-agent conversations.
+
+Supports multiple backends (Cursor, Devin/Windsurf, Claude Code) and
+auto-detects which are available on the current machine.  All commands
+query every available backend by default; use --source to restrict.
+
+Usage examples:
+    ai-conversations list                              List all conversations
+    ai-conversations list --source cursor              List only Cursor conversations
+    ai-conversations list -w ~/src/myproject           Filter by workspace
+    ai-conversations list --workspaces                 List known workspaces
+
+    ai-conversations search "auth"                     Regex search everywhere
+    ai-conversations search "auth" -i                  Case-insensitive
+    ai-conversations search "auth" --thinking          Search thinking blocks only
+    ai-conversations search "auth" --source devin      Restrict to Devin
+
+    ai-conversations show <id>                         Show conversation details
+    ai-conversations show <id> -m                      Show full messages
+
+    ai-conversations export -o exported/               Export all to markdown
+    ai-conversations export --source cursor -w ~/proj  Export Cursor workspace
+"""
+
+from __future__ import annotations
+
+import abc
+import argparse
+import glob as globmod
+import json
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import textwrap
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+
+# ── Common data model ─────────────────────────────────────────────────────────
+
+
+@dataclass
+class Conversation:
+    id: str
+    source: str  # "cursor", "devin", "claude"
+    title: str
+    date: str  # ISO date for display (YYYY-MM-DD or YYYY-MM-DD HH:MM)
+    message_count: int
+    workspace: str
+    raw: object = field(default=None, repr=False)  # backend-specific data
+
+
+@dataclass
+class Message:
+    role: str  # "user", "assistant", "system", "tool"
+    content: str
+    timestamp: str
+    thinking: str = ""
+    tool_name: str = ""
+    tool_args: str = ""
+    tool_result: str = ""
+    source_label: str = ""  # backend-specific role label (e.g. "DEVIN")
+
+
+@dataclass
+class SearchHit:
+    conversation: Conversation
+    role: str
+    timestamp: str
+    source_type: str  # "text", "thinking", "tool_args"
+    context: str  # snippet with surrounding context
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+_HOME = str(Path.home())
+
+
+def shorten_home(path: str) -> str:
+    if path.startswith(_HOME):
+        return "~" + path[len(_HOME):]
+    return path
+
+
+def truncate(text: str, max_len: int = 120) -> str:
+    text = text.replace("\n", " ").strip()
+    return text[:max_len] + "..." if len(text) > max_len else text
+
+
+def snippet_around(content: str, match: re.Match, context: int = 60) -> str:
+    start = max(0, match.start() - context)
+    end = min(len(content), match.end() + context)
+    text = content[start:end].replace("\n", " ")
+    if start > 0:
+        text = "..." + text
+    if end < len(content):
+        text = text + "..."
+    return text
+
+
+def strip_xml_tags(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text)
+
+
+def ts_epoch_to_local(epoch: int) -> str:
+    return (
+        datetime.fromtimestamp(epoch, tz=timezone.utc)
+        .astimezone()
+        .strftime("%Y-%m-%d %H:%M")
+    )
+
+
+def uri_to_path(uri: str) -> str:
+    if uri.startswith("file://"):
+        return unquote(urlparse(uri).path)
+    return uri
+
+
+# ── Backend base class ────────────────────────────────────────────────────────
+
+
+class Backend(abc.ABC):
+    name: str
+    label: str  # short display label
+
+    @abc.abstractmethod
+    def is_available(self) -> bool: ...
+
+    @abc.abstractmethod
+    def list_workspaces(self) -> dict[str, int]:
+        """Return {workspace_path: conversation_count}."""
+
+    @abc.abstractmethod
+    def list_conversations(
+        self, *, workspace: str | None = None
+    ) -> list[Conversation]: ...
+
+    @abc.abstractmethod
+    def search(
+        self,
+        pattern: re.Pattern,
+        *,
+        workspace: str | None = None,
+        thinking_only: bool = False,
+        text_only: bool = False,
+    ) -> dict[str, list[SearchHit]]:
+        """Return {conversation_id: [hits]}."""
+
+    @abc.abstractmethod
+    def get_messages(self, conversation_id: str) -> list[Message]: ...
+
+    @abc.abstractmethod
+    def export_markdown(self, conversation: Conversation) -> str: ...
+
+    def resolve_workspace(
+        self, query: str, workspaces: dict[str, int]
+    ) -> str | None:
+        """Fuzzy-match a workspace path (exact, suffix, substring)."""
+        query = str(Path(query).expanduser().resolve())
+        paths = list(workspaces.keys())
+
+        if query in paths:
+            return query
+        for p in paths:
+            if p.endswith(query) or query.endswith(p.rsplit("/", 1)[-1]):
+                return p
+        for p in paths:
+            if query in p or p in query:
+                return p
+        return None
+
+
+# ── Cursor backend ────────────────────────────────────────────────────────────
+
+
+class CursorBackend(Backend):
+    name = "cursor"
+    label = "cursor"
+
+    DB_PATH = Path.home() / "Library/Application Support/Cursor/User/globalStorage/state.vscdb"
+    WS_STORAGE = Path.home() / "Library/Application Support/Cursor/User/workspaceStorage"
+
+    def is_available(self) -> bool:
+        return self.DB_PATH.exists()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(f"file:{self.DB_PATH}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _build_workspace_map(self) -> dict[str, list[str]]:
+        """workspace_path -> [composer_ids]"""
+        ws_map: dict[str, list[str]] = {}
+        for ws_dir in globmod.glob(str(self.WS_STORAGE / "*")):
+            ws_json = Path(ws_dir) / "workspace.json"
+            state_db = Path(ws_dir) / "state.vscdb"
+            if not ws_json.exists() or not state_db.exists():
+                continue
+            try:
+                ws_data = json.loads(ws_json.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            folder_uri = ws_data.get("folder", "")
+            if not folder_uri:
+                continue
+            folder_path = uri_to_path(folder_uri)
+
+            try:
+                conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+                row = conn.execute(
+                    "SELECT value FROM ItemTable WHERE key = 'composer.composerData'"
+                ).fetchone()
+                composer_ids: list[str] = []
+                if row and row[0]:
+                    composer_ids = json.loads(row[0]).get("selectedComposerIds", [])
+                conn.close()
+            except Exception:
+                continue
+
+            if composer_ids:
+                ws_map[folder_path] = composer_ids
+        return ws_map
+
+    def _id_to_workspace(self, ws_map: dict[str, list[str]]) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for ws_path, ids in ws_map.items():
+            for cid in ids:
+                result[cid] = ws_path
+        return result
+
+    def _get_bubbles(self, conn: sqlite3.Connection, composer_id: str) -> list[dict]:
+        prefix = f"bubbleId:{composer_id}:"
+        rows = conn.execute(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE ?", (prefix + "%",)
+        ).fetchall()
+        bubbles = []
+        for row in rows:
+            if row["value"] is None:
+                continue
+            bubbles.append(json.loads(row["value"]))
+        bubbles.sort(key=lambda b: b.get("createdAt", ""))
+        return bubbles
+
+    @staticmethod
+    def _format_thinking(thinking: object) -> str:
+        if not thinking:
+            return ""
+        if isinstance(thinking, dict):
+            return thinking.get("text", "")
+        return str(thinking)
+
+    def _get_all_composer_ids(self, conn: sqlite3.Connection) -> list[str]:
+        rows = conn.execute(
+            "SELECT DISTINCT substr(key, 10, 36) FROM cursorDiskKV "
+            "WHERE key LIKE 'bubbleId:%'"
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def _conversation_from_bubbles(
+        self, conn: sqlite3.Connection, cid: str, workspace: str
+    ) -> Conversation:
+        bubbles = self._get_bubbles(conn, cid)
+        first_date = "unknown"
+        preview = ""
+        count = 0
+        for b in bubbles:
+            has_content = (
+                b.get("text")
+                or self._format_thinking(b.get("thinking"))
+                or b.get("toolFormerData")
+            )
+            if has_content:
+                count += 1
+            if first_date == "unknown" and b.get("createdAt"):
+                first_date = b["createdAt"][:10]
+            if not preview and b.get("type") == 1 and b.get("text"):
+                preview = truncate(b["text"], 80)
+        return Conversation(
+            id=cid,
+            source=self.name,
+            title=preview or cid[:12],
+            date=first_date,
+            message_count=count,
+            workspace=workspace,
+        )
+
+    # -- public interface --
+
+    def list_workspaces(self) -> dict[str, int]:
+        ws_map = self._build_workspace_map()
+        return {path: len(ids) for path, ids in ws_map.items()}
+
+    def list_conversations(
+        self, *, workspace: str | None = None
+    ) -> list[Conversation]:
+        conn = self._connect()
+        ws_map = self._build_workspace_map()
+        id_to_ws = self._id_to_workspace(ws_map)
+
+        if workspace:
+            resolved = self.resolve_workspace(workspace, self.list_workspaces())
+            if not resolved:
+                return []
+            cids = ws_map.get(resolved, [])
+        else:
+            cids = self._get_all_composer_ids(conn)
+
+        convs = []
+        for cid in cids:
+            ws = id_to_ws.get(cid, "")
+            convs.append(self._conversation_from_bubbles(conn, cid, ws))
+        conn.close()
+        return convs
+
+    def search(
+        self,
+        pattern: re.Pattern,
+        *,
+        workspace: str | None = None,
+        thinking_only: bool = False,
+        text_only: bool = False,
+    ) -> dict[str, list[SearchHit]]:
+        conn = self._connect()
+        ws_map = self._build_workspace_map()
+        id_to_ws = self._id_to_workspace(ws_map)
+
+        if workspace:
+            resolved = self.resolve_workspace(workspace, self.list_workspaces())
+            cids = ws_map.get(resolved, []) if resolved else []
+        else:
+            cids = self._get_all_composer_ids(conn)
+
+        results: dict[str, list[SearchHit]] = {}
+        for cid in cids:
+            ws = id_to_ws.get(cid, "")
+            bubbles = self._get_bubbles(conn, cid)
+            hits: list[SearchHit] = []
+
+            for bubble in bubbles:
+                parts = self._bubble_text_parts(bubble)
+                for source_type, content in parts:
+                    if thinking_only and source_type != "thinking":
+                        continue
+                    if text_only and source_type != "text":
+                        continue
+                    for m in pattern.finditer(content):
+                        typ = bubble.get("type")
+                        role = (
+                            "user" if typ == 1 else "assistant" if typ == 2 else f"type_{typ}"
+                        )
+                        conv = self._conversation_from_bubbles(conn, cid, ws)
+                        hits.append(
+                            SearchHit(
+                                conversation=conv,
+                                role=role,
+                                timestamp=bubble.get("createdAt", "unknown"),
+                                source_type=source_type,
+                                context=snippet_around(content, m),
+                            )
+                        )
+            if hits:
+                results[cid] = hits
+
+        conn.close()
+        return results
+
+    def _bubble_text_parts(self, bubble: dict) -> list[tuple[str, str]]:
+        parts: list[tuple[str, str]] = []
+        text = bubble.get("text", "")
+        if text:
+            parts.append(("text", text))
+        thinking = self._format_thinking(bubble.get("thinking"))
+        if thinking:
+            parts.append(("thinking", thinking))
+        tool_data = bubble.get("toolFormerData")
+        if tool_data and isinstance(tool_data, dict):
+            raw_args = tool_data.get("rawArgs", "")
+            if raw_args:
+                parts.append(("tool_args", str(raw_args)))
+        return parts
+
+    def get_messages(self, conversation_id: str) -> list[Message]:
+        conn = self._connect()
+        bubbles = self._get_bubbles(conn, conversation_id)
+        conn.close()
+        messages: list[Message] = []
+        for b in bubbles:
+            has_content = (
+                b.get("text")
+                or self._format_thinking(b.get("thinking"))
+                or b.get("toolFormerData")
+            )
+            if not has_content:
+                continue
+            typ = b.get("type")
+            role = "user" if typ == 1 else "assistant" if typ == 2 else "system"
+
+            tool_name = tool_args = tool_result = ""
+            td = b.get("toolFormerData")
+            if td and isinstance(td, dict):
+                role = "tool"
+                tool_name = td.get("name", "")
+                raw = td.get("rawArgs", "")
+                try:
+                    tool_args = (
+                        json.dumps(json.loads(raw), indent=2)
+                        if isinstance(raw, str) and raw
+                        else str(raw) if raw else ""
+                    )
+                except (json.JSONDecodeError, TypeError):
+                    tool_args = str(raw)[:500]
+            tr = b.get("toolResult")
+            if tr and isinstance(tr, dict):
+                tool_result = str(tr.get("content", ""))[:2000]
+
+            messages.append(
+                Message(
+                    role=role,
+                    content=b.get("text", ""),
+                    timestamp=b.get("createdAt", ""),
+                    thinking=self._format_thinking(b.get("thinking")),
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    tool_result=tool_result,
+                )
+            )
+        return messages
+
+    def export_markdown(self, conversation: Conversation) -> str:
+        messages = self.get_messages(conversation.id)
+        lines = [
+            f"# Conversation {conversation.id}",
+            "",
+            f"- **Source:** Cursor",
+            f"- **Composer ID:** `{conversation.id}`",
+            f"- **Workspace:** `{conversation.workspace}`",
+            f"- **Date:** {conversation.date}",
+            f"- **Messages:** {conversation.message_count}",
+            "",
+            "---",
+            "",
+        ]
+        for msg in messages:
+            role_label = msg.role.upper()
+            lines.append(f"### [{role_label}] {msg.timestamp}")
+            lines.append("")
+            if msg.thinking:
+                lines.append("<details><summary>Thinking</summary>")
+                lines.append("")
+                lines.append(msg.thinking)
+                lines.append("")
+                lines.append("</details>")
+                lines.append("")
+            if msg.content:
+                lines.append(msg.content)
+                lines.append("")
+            if msg.tool_name:
+                lines.append(
+                    f"**Tool call:** `{msg.tool_name}`"
+                )
+                if msg.tool_args:
+                    lines.append(f"```json\n{msg.tool_args}\n```")
+                lines.append("")
+            if msg.tool_result:
+                lines.append("**Tool result:**")
+                lines.append(f"```\n{msg.tool_result}\n```")
+                lines.append("")
+            lines.append("---")
+            lines.append("")
+        return "\n".join(lines)
+
+
+# ── Devin backend ─────────────────────────────────────────────────────────────
+
+
+class DevinBackend(Backend):
+    name = "devin"
+    label = "devin"
+
+    DB_PATH = Path.home() / ".local/share/devin/cli/sessions.db"
+    SUMMARIES_DIR = Path.home() / ".local/share/devin/cli/summaries"
+
+    def is_available(self) -> bool:
+        return self.DB_PATH.exists()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(f"file:{self.DB_PATH}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _walk_main_chain(
+        self, conn: sqlite3.Connection, session_id: str
+    ) -> list[dict]:
+        row = conn.execute(
+            "SELECT main_chain_id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            return []
+        tip = row["main_chain_id"]
+        if tip is None:
+            rows = conn.execute(
+                "SELECT chat_message FROM message_nodes "
+                "WHERE session_id = ? ORDER BY node_id",
+                (session_id,),
+            ).fetchall()
+            return [json.loads(r["chat_message"]) for r in rows]
+
+        rows = conn.execute(
+            """
+            WITH RECURSIVE chain(nid) AS (
+                SELECT ?
+                UNION ALL
+                SELECT m.parent_node_id
+                FROM message_nodes m, chain c
+                WHERE m.session_id = ? AND m.node_id = c.nid
+                  AND m.parent_node_id IS NOT NULL
+            )
+            SELECT m.chat_message
+            FROM message_nodes m
+            JOIN chain c ON m.node_id = c.nid
+            WHERE m.session_id = ?
+            ORDER BY m.node_id ASC
+            """,
+            (tip, session_id, session_id),
+        ).fetchall()
+        return [json.loads(r["chat_message"]) for r in rows]
+
+    # -- public interface --
+
+    def list_workspaces(self) -> dict[str, int]:
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT working_directory, COUNT(*) as cnt "
+            "FROM sessions GROUP BY working_directory"
+        ).fetchall()
+        conn.close()
+        return {r["working_directory"]: r["cnt"] for r in rows if r["working_directory"]}
+
+    def list_conversations(
+        self, *, workspace: str | None = None
+    ) -> list[Conversation]:
+        conn = self._connect()
+        if workspace:
+            resolved = self.resolve_workspace(workspace, self.list_workspaces())
+            if not resolved:
+                conn.close()
+                return []
+            where, params = "WHERE working_directory = ?", [resolved]
+        else:
+            where, params = "", []
+
+        rows = conn.execute(
+            f"""
+            SELECT s.id, s.title, s.working_directory, s.created_at,
+                   s.last_activity_at, s.model,
+                   (SELECT COUNT(*) FROM message_nodes mn
+                    WHERE mn.session_id = s.id) as msg_count
+            FROM sessions s {where}
+            ORDER BY s.last_activity_at DESC
+            """,
+            params,
+        ).fetchall()
+        conn.close()
+
+        return [
+            Conversation(
+                id=r["id"],
+                source=self.name,
+                title=r["title"] or "Untitled",
+                date=ts_epoch_to_local(r["last_activity_at"]),
+                message_count=r["msg_count"],
+                workspace=r["working_directory"] or "",
+                raw=dict(r),
+            )
+            for r in rows
+        ]
+
+    def search(
+        self,
+        pattern: re.Pattern,
+        *,
+        workspace: str | None = None,
+        thinking_only: bool = False,
+        text_only: bool = False,
+    ) -> dict[str, list[SearchHit]]:
+        if thinking_only:
+            return {}  # Devin has no thinking blocks
+
+        conn = self._connect()
+        if workspace:
+            resolved = self.resolve_workspace(workspace, self.list_workspaces())
+            if not resolved:
+                conn.close()
+                return {}
+            where_clause = "AND s.working_directory = ?"
+            params: list = [resolved]
+        else:
+            where_clause = ""
+            params = []
+
+        rows = conn.execute(
+            f"""
+            SELECT mn.session_id, mn.node_id, mn.chat_message,
+                   s.title, s.working_directory, s.created_at,
+                   s.last_activity_at, s.model,
+                   (SELECT COUNT(*) FROM message_nodes mn2
+                    WHERE mn2.session_id = s.id) as msg_count
+            FROM message_nodes mn
+            JOIN sessions s ON mn.session_id = s.id
+            WHERE json_extract(mn.chat_message, '$.role') IN ('user', 'assistant')
+            {where_clause}
+            ORDER BY mn.session_id, mn.node_id
+            """,
+            params,
+        ).fetchall()
+
+        results: dict[str, list[SearchHit]] = {}
+        for r in rows:
+            msg = json.loads(r["chat_message"])
+            content = msg.get("content", "")
+            if not content:
+                continue
+
+            for m in pattern.finditer(content):
+                sid = r["session_id"]
+                if sid not in results:
+                    results[sid] = []
+                conv = Conversation(
+                    id=sid,
+                    source=self.name,
+                    title=r["title"] or "Untitled",
+                    date=ts_epoch_to_local(r["last_activity_at"]),
+                    message_count=r["msg_count"],
+                    workspace=r["working_directory"] or "",
+                )
+                results[sid].append(
+                    SearchHit(
+                        conversation=conv,
+                        role=msg.get("role", "unknown"),
+                        timestamp="",
+                        source_type="text",
+                        context=snippet_around(content, m),
+                    )
+                )
+
+        conn.close()
+        return results
+
+    def get_messages(self, conversation_id: str) -> list[Message]:
+        conn = self._connect()
+        raw_msgs = self._walk_main_chain(conn, conversation_id)
+        conn.close()
+
+        messages: list[Message] = []
+        for msg in raw_msgs:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            source_label = {"user": "YOU", "assistant": "DEVIN"}.get(role, role.upper())
+            messages.append(
+                Message(
+                    role=role,
+                    content=content,
+                    timestamp="",
+                    source_label=source_label,
+                )
+            )
+        return messages
+
+    def export_markdown(self, conversation: Conversation) -> str:
+        conn = self._connect()
+        raw_msgs = self._walk_main_chain(conn, conversation.id)
+        conn.close()
+
+        lines = [
+            f"# {conversation.title}",
+            "",
+            f"- **Source:** Devin",
+            f"- **Session ID:** `{conversation.id}`",
+            f"- **Workspace:** `{conversation.workspace}`",
+            f"- **Date:** {conversation.date}",
+            f"- **Messages:** {conversation.message_count}",
+            "",
+            "---",
+            "",
+        ]
+
+        for msg in raw_msgs:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+
+            if role == "system":
+                continue
+            elif role == "tool":
+                cleaned = strip_xml_tags(content).strip()
+                if not cleaned:
+                    continue
+                if len(cleaned) > 500:
+                    cleaned = cleaned[:500] + "\n\n[... output truncated ...]"
+                lines.append("<details>")
+                lines.append(f"<summary>Tool output ({len(content)} chars)</summary>")
+                lines.append("")
+                lines.append(f"```\n{cleaned}\n```")
+                lines.append("</details>")
+                lines.append("")
+            elif role == "user":
+                lines.append("### [USER]")
+                lines.append("")
+                lines.append(content.strip())
+                lines.append("")
+                lines.append("---")
+                lines.append("")
+            elif role == "assistant":
+                lines.append("### [ASSISTANT]")
+                lines.append("")
+                lines.append(content.strip())
+                lines.append("")
+                lines.append("---")
+                lines.append("")
+
+        return "\n".join(lines)
+
+    def export_summaries(self, conversations: list[Conversation], out_dir: Path) -> int:
+        """Copy Devin compacted summary files that match the exported conversations."""
+        if not self.SUMMARIES_DIR.exists():
+            return 0
+        workdirs = {c.workspace for c in conversations}
+        summary_dir = out_dir / "summaries"
+        count = 0
+        for src in self.SUMMARIES_DIR.glob("history_*.md"):
+            try:
+                head = src.read_text(encoding="utf-8", errors="replace")[:2000]
+                if any(wd in head for wd in workdirs if wd):
+                    summary_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, summary_dir / src.name)
+                    count += 1
+            except OSError:
+                pass
+        return count
+
+
+# ── Claude Code backend (stub) ───────────────────────────────────────────────
+
+
+class ClaudeCodeBackend(Backend):
+    """Claude Code stores sessions as JSONL under ~/.claude/projects/.
+
+    Each project directory is the working directory path with / replaced by -.
+    Sessions are ULID-named .jsonl files; each line is one event (user message,
+    assistant response, tool call, tool result, or system metadata).
+
+    A global prompt index lives at ~/.claude/history.jsonl.
+    Project-level metadata is in sessions-index.json per project dir.
+    """
+
+    name = "claude"
+    label = "claude"
+
+    BASE_DIR = Path.home() / ".claude"
+    PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+    def is_available(self) -> bool:
+        return self.PROJECTS_DIR.exists() and any(self.PROJECTS_DIR.iterdir())
+
+    def _project_dirs(self) -> list[Path]:
+        if not self.PROJECTS_DIR.exists():
+            return []
+        return [d for d in self.PROJECTS_DIR.iterdir() if d.is_dir()]
+
+    def _decode_project_path(self, dirname: str) -> str:
+        """Convert an encoded project dir name back to a filesystem path.
+
+        Claude Code encodes paths by replacing / with -.  The leading - maps to
+        the root /, so "-Users-me-Code-proj" becomes "/Users/me/Code/proj".
+        """
+        if not dirname.startswith("-"):
+            return dirname
+        return "/" + dirname[1:].replace("-", "/")
+
+    def _session_files(self, project_dir: Path) -> list[Path]:
+        sessions_dir = project_dir / "sessions"
+        if not sessions_dir.exists():
+            return []
+        return sorted(sessions_dir.glob("*.jsonl"))
+
+    def _parse_session(self, session_file: Path) -> tuple[list[dict], dict]:
+        """Parse a JSONL session file into (events, metadata)."""
+        events: list[dict] = []
+        metadata: dict = {}
+        try:
+            for line in session_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    events.append(obj)
+                except json.JSONDecodeError:
+                    continue
+        except OSError:
+            pass
+        return events, metadata
+
+    def _events_to_messages(self, events: list[dict]) -> list[Message]:
+        messages: list[Message] = []
+        for ev in events:
+            role = ev.get("role", "")
+            if not role:
+                ev_type = ev.get("type", "")
+                if ev_type == "human":
+                    role = "user"
+                elif ev_type == "assistant":
+                    role = "assistant"
+                elif ev_type == "system":
+                    role = "system"
+                else:
+                    continue
+
+            content = ""
+            thinking = ""
+
+            raw_content = ev.get("content", "")
+            if isinstance(raw_content, str):
+                content = raw_content
+            elif isinstance(raw_content, list):
+                text_parts: list[str] = []
+                for block in raw_content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            text_parts.append(block.get("text", ""))
+                        elif block.get("type") == "thinking":
+                            thinking = block.get("thinking", "")
+                        elif block.get("type") == "tool_use":
+                            messages.append(
+                                Message(
+                                    role="tool",
+                                    content="",
+                                    timestamp=ev.get("timestamp", ""),
+                                    tool_name=block.get("name", ""),
+                                    tool_args=json.dumps(
+                                        block.get("input", {}), indent=2
+                                    ),
+                                )
+                            )
+                    elif isinstance(block, str):
+                        text_parts.append(block)
+                content = "\n".join(text_parts)
+
+            if content or thinking:
+                messages.append(
+                    Message(
+                        role=role,
+                        content=content,
+                        timestamp=ev.get("timestamp", ""),
+                        thinking=thinking,
+                        source_label=(
+                            "YOU" if role == "user" else "CLAUDE" if role == "assistant" else role.upper()
+                        ),
+                    )
+                )
+        return messages
+
+    def _session_preview(self, events: list[dict]) -> tuple[str, str, int]:
+        """Return (date, first_user_message_preview, message_count)."""
+        date = "unknown"
+        preview = ""
+        count = 0
+        for ev in events:
+            role = ev.get("role", ev.get("type", ""))
+            if role in ("user", "human", "assistant"):
+                count += 1
+            ts = ev.get("timestamp", "")
+            if date == "unknown" and ts:
+                date = str(ts)[:10]
+            if not preview and role in ("user", "human"):
+                raw = ev.get("content", "")
+                text = raw if isinstance(raw, str) else ""
+                if isinstance(raw, list):
+                    for block in raw:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "")
+                            break
+                        elif isinstance(block, str):
+                            text = block
+                            break
+                if text:
+                    preview = truncate(text, 80)
+        return date, preview, count
+
+    # -- public interface --
+
+    def list_workspaces(self) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for pdir in self._project_dirs():
+            ws_path = self._decode_project_path(pdir.name)
+            session_count = len(self._session_files(pdir))
+            if session_count:
+                result[ws_path] = session_count
+        return result
+
+    def list_conversations(
+        self, *, workspace: str | None = None
+    ) -> list[Conversation]:
+        if workspace:
+            ws_map = self.list_workspaces()
+            resolved = self.resolve_workspace(workspace, ws_map)
+            if not resolved:
+                return []
+            project_dirs = [
+                d
+                for d in self._project_dirs()
+                if self._decode_project_path(d.name) == resolved
+            ]
+        else:
+            project_dirs = self._project_dirs()
+
+        convs: list[Conversation] = []
+        for pdir in project_dirs:
+            ws_path = self._decode_project_path(pdir.name)
+            for sf in self._session_files(pdir):
+                events, _ = self._parse_session(sf)
+                date, preview, count = self._session_preview(events)
+                convs.append(
+                    Conversation(
+                        id=sf.stem,
+                        source=self.name,
+                        title=preview or sf.stem[:12],
+                        date=date,
+                        message_count=count,
+                        workspace=ws_path,
+                    )
+                )
+        return convs
+
+    def search(
+        self,
+        pattern: re.Pattern,
+        *,
+        workspace: str | None = None,
+        thinking_only: bool = False,
+        text_only: bool = False,
+    ) -> dict[str, list[SearchHit]]:
+        convs = self.list_conversations(workspace=workspace)
+        results: dict[str, list[SearchHit]] = {}
+
+        for conv in convs:
+            project_dirs = [
+                d
+                for d in self._project_dirs()
+                if self._decode_project_path(d.name) == conv.workspace
+            ]
+            for pdir in project_dirs:
+                sf = pdir / "sessions" / f"{conv.id}.jsonl"
+                if not sf.exists():
+                    continue
+                events, _ = self._parse_session(sf)
+                messages = self._events_to_messages(events)
+                hits: list[SearchHit] = []
+                for msg in messages:
+                    if msg.role in ("system",):
+                        continue
+                    search_parts: list[tuple[str, str]] = []
+                    if msg.content and not thinking_only:
+                        search_parts.append(("text", msg.content))
+                    if msg.thinking and not text_only:
+                        search_parts.append(("thinking", msg.thinking))
+                    if msg.tool_args and not thinking_only and not text_only:
+                        search_parts.append(("tool_args", msg.tool_args))
+
+                    for source_type, content in search_parts:
+                        for m in pattern.finditer(content):
+                            hits.append(
+                                SearchHit(
+                                    conversation=conv,
+                                    role=msg.role,
+                                    timestamp=msg.timestamp,
+                                    source_type=source_type,
+                                    context=snippet_around(content, m),
+                                )
+                            )
+                if hits:
+                    results[conv.id] = hits
+        return results
+
+    def get_messages(self, conversation_id: str) -> list[Message]:
+        for pdir in self._project_dirs():
+            sf = pdir / "sessions" / f"{conversation_id}.jsonl"
+            if sf.exists():
+                events, _ = self._parse_session(sf)
+                return self._events_to_messages(events)
+        return []
+
+    def export_markdown(self, conversation: Conversation) -> str:
+        messages = self.get_messages(conversation.id)
+        lines = [
+            f"# {conversation.title}",
+            "",
+            f"- **Source:** Claude Code",
+            f"- **Session ID:** `{conversation.id}`",
+            f"- **Workspace:** `{conversation.workspace}`",
+            f"- **Date:** {conversation.date}",
+            f"- **Messages:** {conversation.message_count}",
+            "",
+            "---",
+            "",
+        ]
+        for msg in messages:
+            if msg.role == "system":
+                continue
+            role_label = msg.role.upper()
+            lines.append(f"### [{role_label}] {msg.timestamp}")
+            lines.append("")
+            if msg.thinking:
+                lines.append("<details><summary>Thinking</summary>")
+                lines.append("")
+                lines.append(msg.thinking)
+                lines.append("")
+                lines.append("</details>")
+                lines.append("")
+            if msg.content:
+                lines.append(msg.content)
+                lines.append("")
+            if msg.tool_name:
+                lines.append(f"**Tool call:** `{msg.tool_name}`")
+                if msg.tool_args:
+                    lines.append(f"```json\n{msg.tool_args}\n```")
+                lines.append("")
+            if msg.tool_result:
+                lines.append("**Tool result:**")
+                lines.append(f"```\n{msg.tool_result}\n```")
+                lines.append("")
+            lines.append("---")
+            lines.append("")
+        return "\n".join(lines)
+
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+
+ALL_BACKENDS: list[Backend] = [CursorBackend(), DevinBackend(), ClaudeCodeBackend()]
+
+
+def get_backends(source: str | None = None) -> list[Backend]:
+    """Return available backends, optionally filtered by --source."""
+    if source:
+        matches = [b for b in ALL_BACKENDS if b.name == source]
+        if not matches:
+            names = ", ".join(b.name for b in ALL_BACKENDS)
+            print(f"Unknown source: {source} (available: {names})", file=sys.stderr)
+            sys.exit(1)
+        b = matches[0]
+        if not b.is_available():
+            print(
+                f"{b.name} is not available on this machine "
+                f"(data not found).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return matches
+
+    available = [b for b in ALL_BACKENDS if b.is_available()]
+    if not available:
+        print("No AI conversation data found on this machine.", file=sys.stderr)
+        print(
+            "Looked for: "
+            + ", ".join(f"{b.name} ({b.__class__.__name__})" for b in ALL_BACKENDS),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return available
+
+
+# ── CLI commands ──────────────────────────────────────────────────────────────
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    backends = get_backends(args.source)
+
+    if args.workspaces:
+        print(f"{'Source':<10} {'Convs':>5}  Workspace Path")
+        print("─" * 90)
+        for b in backends:
+            for path, count in sorted(b.list_workspaces().items()):
+                print(f"{b.label:<10} {count:>5}  {shorten_home(path)}")
+        return
+
+    all_convs: list[Conversation] = []
+    for b in backends:
+        all_convs.extend(b.list_conversations(workspace=args.workspace))
+
+    if not all_convs:
+        scope = f"in workspace {args.workspace}" if args.workspace else "anywhere"
+        sources = ", ".join(b.name for b in backends)
+        print(f"No conversations found {scope} (searched: {sources}).")
+        return
+
+    print(
+        f"{'#':<4} {'Source':<8} {'Date':<17} {'Msgs':>5}  "
+        f"{'Workspace':<30} {'ID':<14} Title"
+    )
+    print("─" * 120)
+    for i, c in enumerate(all_convs, 1):
+        ws = shorten_home(c.workspace)
+        if len(ws) > 29:
+            ws = "..." + ws[-26:]
+        print(
+            f"{i:<4} {c.source:<8} {c.date:<17} {c.message_count:>5}  "
+            f"{ws:<30} {c.id[:12]:<14} {truncate(c.title, 35)}"
+        )
+    print(f"\nFound {len(all_convs)} conversation(s).")
+
+
+def cmd_search(args: argparse.Namespace) -> None:
+    flags = re.IGNORECASE if args.case_insensitive else 0
+    try:
+        pattern = re.compile(args.query, flags)
+    except re.error as e:
+        print(f"Invalid regex pattern: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    backends = get_backends(args.source)
+    all_results: dict[str, list[SearchHit]] = {}
+
+    sources_searched: list[str] = []
+    for b in backends:
+        sources_searched.append(b.name)
+        results = b.search(
+            pattern,
+            workspace=args.workspace,
+            thinking_only=args.thinking,
+            text_only=args.text,
+        )
+        for cid, hits in results.items():
+            key = f"{b.name}:{cid}"
+            all_results[key] = hits
+
+    print(f"\nSearching for: {args.query}")
+    qualifiers: list[str] = []
+    if args.case_insensitive:
+        qualifiers.append("case-insensitive")
+    if args.thinking:
+        qualifiers.append("thinking blocks only")
+    elif args.text:
+        qualifiers.append("visible text only")
+    qualifiers.append(f"sources: {', '.join(sources_searched)}")
+    print(f"  ({'; '.join(qualifiers)})")
+
+    if not all_results:
+        print("\nNo matches found.")
+        return
+
+    total_hits = sum(len(h) for h in all_results.values())
+    print(f"\nFound {total_hits} match(es) in {len(all_results)} conversation(s):\n")
+
+    for key, hits in all_results.items():
+        conv = hits[0].conversation
+        print("─" * 80)
+        print(f"  [{conv.source}] {conv.title}")
+        print(f"  ID: {conv.id}")
+        if conv.workspace:
+            print(f"  Workspace: {shorten_home(conv.workspace)}")
+        print(f"  Date: {conv.date}  |  Messages: {conv.message_count}")
+        print(f"  Matches: {len(hits)}")
+        print()
+
+        for h in hits[:10]:
+            print(f"    [{h.role}] {h.timestamp} ({h.source_type})")
+            print(f"      {h.context}")
+            print()
+
+        if len(hits) > 10:
+            print(f"    ... and {len(hits) - 10} more match(es)")
+            print()
+
+    if args.export:
+        output_dir = Path(args.output or "exported")
+        _do_export(backends, all_results, output_dir)
+
+
+def cmd_show(args: argparse.Namespace) -> None:
+    backends = get_backends(args.source)
+
+    conv: Conversation | None = None
+    backend: Backend | None = None
+    for b in backends:
+        for c in b.list_conversations():
+            if c.id == args.conversation_id:
+                conv = c
+                backend = b
+                break
+        if conv:
+            break
+
+    if not conv or not backend:
+        print(
+            f"Conversation '{args.conversation_id}' not found.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"Source:    {conv.source}")
+    print(f"ID:       {conv.id}")
+    print(f"Title:    {conv.title}")
+    print(f"Workspace:{' ' + shorten_home(conv.workspace) if conv.workspace else ''}")
+    print(f"Date:     {conv.date}")
+    print(f"Messages: {conv.message_count}")
+
+    if args.messages:
+        messages = backend.get_messages(conv.id)
+        print("\n--- Conversation ---\n")
+        for msg in messages:
+            if msg.role == "system" and not args.verbose:
+                continue
+            if msg.role == "tool" and not args.verbose:
+                snippet = truncate(strip_xml_tags(msg.content or msg.tool_args), 100)
+                if snippet.strip():
+                    print(f"  [tool: {msg.tool_name or '?'}] {snippet}")
+                continue
+
+            label = msg.source_label or msg.role.upper()
+            print(f"=== {label} ===")
+            if msg.thinking and args.verbose:
+                print(f"[thinking] {msg.thinking[:500]}")
+            if msg.content:
+                if msg.role == "assistant" and not args.verbose:
+                    print(strip_xml_tags(msg.content).strip())
+                else:
+                    print(msg.content)
+            if msg.tool_name:
+                print(f"  -> tool: {msg.tool_name}")
+            print()
+
+
+def cmd_export(args: argparse.Namespace) -> None:
+    backends = get_backends(args.source)
+    output_dir = Path(args.output or "exported")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    all_convs: list[tuple[Backend, Conversation]] = []
+    for b in backends:
+        convs = b.list_conversations(workspace=args.workspace)
+        for c in convs:
+            all_convs.append((b, c))
+
+    if not all_convs:
+        scope = f"in workspace {args.workspace}" if args.workspace else "anywhere"
+        print(f"No conversations found {scope}.")
+        return
+
+    print(f"Exporting {len(all_convs)} conversation(s) to {output_dir}/\n")
+    exported = 0
+    for b, conv in all_convs:
+        md = b.export_markdown(conv)
+        date_part = conv.date[:10].replace("-", "")
+        safe_id = re.sub(r"[^\w-]", "", conv.id)[:24]
+        filename = f"{date_part}_{conv.source}_{safe_id}.md"
+        filepath = output_dir / filename
+        filepath.write_text(md, encoding="utf-8")
+        exported += 1
+        print(f"  [{conv.source}] {filename}")
+
+    # Devin-specific: copy summaries
+    for b in backends:
+        if isinstance(b, DevinBackend):
+            devin_convs = [c for be, c in all_convs if be is b]
+            n = b.export_summaries(devin_convs, output_dir)
+            if n:
+                print(f"\nCopied {n} Devin summary file(s).")
+
+    print(f"\nExported {exported} conversation(s) to {output_dir}/")
+
+
+def _do_export(
+    backends: list[Backend],
+    results: dict[str, list[SearchHit]],
+    output_dir: Path,
+) -> None:
+    """Export conversations that had search hits."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"\nExporting matching conversations to {output_dir}/")
+
+    exported = 0
+    for key, hits in results.items():
+        conv = hits[0].conversation
+        b = next(b for b in backends if b.name == conv.source)
+        # re-fetch a complete conversation object for export
+        full_convs = b.list_conversations()
+        full_conv = next((c for c in full_convs if c.id == conv.id), conv)
+
+        md = b.export_markdown(full_conv)
+        date_part = conv.date[:10].replace("-", "")
+        safe_id = re.sub(r"[^\w-]", "", conv.id)[:24]
+        filename = f"{date_part}_{conv.source}_{safe_id}.md"
+        filepath = output_dir / filename
+        filepath.write_text(md, encoding="utf-8")
+        exported += 1
+        print(f"  [{conv.source}] {filename}")
+
+    print(f"Exported {exported} conversation(s).")
+
+
+# ── CLI parser ────────────────────────────────────────────────────────────────
+
+SOURCE_NAMES = "cursor, devin, claude"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ai-conversations",
+        description="Search, list, and export AI coding-agent conversations.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent(f"""\
+            supported sources: {SOURCE_NAMES}
+
+            examples:
+              %(prog)s list                              List all conversations
+              %(prog)s list --source cursor              Cursor only
+              %(prog)s list -w ~/src/myproject            Filter by workspace
+              %(prog)s list --workspaces                  List workspaces
+
+              %(prog)s search "auth"                     Regex search everywhere
+              %(prog)s search "auth" -i                  Case-insensitive
+              %(prog)s search "auth" --thinking           Thinking blocks only
+              %(prog)s search "auth" --source devin      Restrict to Devin
+
+              %(prog)s show <conversation-id>            Show details
+              %(prog)s show <conversation-id> -m         Show messages
+
+              %(prog)s export -o exported/               Export all to markdown
+              %(prog)s export --source cursor -o out/    Export Cursor only
+        """),
+    )
+    parser.add_argument(
+        "-s", "--source",
+        choices=["cursor", "devin", "claude"],
+        help="Restrict to a specific AI tool (default: all available)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # list
+    p_list = sub.add_parser("list", aliases=["ls"], help="List conversations")
+    p_list.add_argument("-w", "--workspace", help="Filter by workspace path")
+    p_list.add_argument(
+        "--workspaces", action="store_true", help="List workspaces instead"
+    )
+
+    # search
+    p_search = sub.add_parser(
+        "search", aliases=["grep"], help="Regex search across conversations"
+    )
+    p_search.add_argument("query", help="Regex pattern to search for")
+    p_search.add_argument("-w", "--workspace", help="Filter by workspace path")
+    p_search.add_argument(
+        "-i", "--case-insensitive", action="store_true", help="Case-insensitive"
+    )
+    p_search.add_argument(
+        "--thinking", action="store_true", help="Search only in thinking blocks"
+    )
+    p_search.add_argument(
+        "--text", action="store_true", help="Search only in visible text"
+    )
+    p_search.add_argument(
+        "--export", action="store_true", help="Export matching conversations"
+    )
+    p_search.add_argument("-o", "--output", help="Output directory for exports")
+
+    # show
+    p_show = sub.add_parser("show", help="Show conversation details")
+    p_show.add_argument("conversation_id", help="Conversation / session ID")
+    p_show.add_argument(
+        "-m", "--messages", action="store_true", help="Show messages"
+    )
+    p_show.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Include system/tool messages and thinking",
+    )
+
+    # export
+    p_export = sub.add_parser("export", help="Export conversations to markdown")
+    p_export.add_argument("-o", "--output", help="Output directory (default: exported/)")
+    p_export.add_argument("-w", "--workspace", help="Filter by workspace path")
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    cmd_map = {
+        "list": cmd_list,
+        "ls": cmd_list,
+        "search": cmd_search,
+        "grep": cmd_search,
+        "show": cmd_show,
+        "export": cmd_export,
+    }
+    cmd_map[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
