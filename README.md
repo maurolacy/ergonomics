@@ -99,7 +99,40 @@ source ~/.bash_aliases   # activate immediately
 ./aliases/sync.sh push   # push local base changes into the repo
 ```
 
-### 4. resources - Dev environment bootstrap
+### 4. ai-conversations - AI conversation search & export
+
+A unified CLI for searching, listing, and exporting conversations from
+AI coding agents. Auto-detects which tools are installed and queries all
+of them by default.
+
+**Supported backends:** Cursor, Devin/Windsurf, Claude Code
+
+```
+ai-conversations list                         # list all conversations
+ai-conversations list --workspaces            # list known workspaces
+ai-conversations list --source cursor         # Cursor only
+ai-conversations list -w ~/src/myproject      # filter by workspace
+
+ai-conversations search "auth"                # regex search everywhere
+ai-conversations search "auth" -i             # case-insensitive
+ai-conversations search "auth" --thinking     # thinking blocks only
+
+ai-conversations show <id> -m                 # show full conversation
+
+ai-conversations export -o exported/          # export all to markdown
+```
+
+**Features:**
+
+- Regex search across all backends simultaneously
+- Search inside thinking blocks (`--thinking`) or visible text only (`--text`)
+- Fuzzy workspace matching (partial paths work)
+- Exported markdown includes thinking in `<details>` blocks, tool calls, and results
+- `--source cursor|devin|claude` to restrict scope
+
+**Prerequisites:** Python 3.10+, no external dependencies (stdlib only)
+
+### 5. resources - Dev environment bootstrap
 
 Installs GNU utils and essential dev tools via Homebrew, and sets up a
 portable `.bashrc` config. Because the first thing you do on a new Mac is
@@ -134,6 +167,15 @@ your `~/.bashrc` — `bashrc_base` only manages the portable parts.
 - **Sleep:** Apple provides no native keyboard shortcut to sleep.
   `Cmd+Option+Power` only sleeps the display. Creating a Quick Action and
   binding it to a shortcut is the only native-only solution.
+
+- **ai-conversations:** Every AI tool stores conversations in its own
+  format and location. Cursor uses SQLite with "bubbles" keyed by composer
+  IDs, Devin uses SQLite with a linked-list message chain, and Claude Code
+  uses JSONL session files. To make matters worse, newer IDE versions are
+  removing their built-in transcript export features entirely. This tool
+  wraps all three behind a single interface so you can search, export, and
+  own your conversation history regardless of which tool you used or what
+  the vendor decides to ship next.
 
 - **out_for_a_walk:** Microsoft's Conditional Access policies block API
   access via the Graph API device code flow from unmanaged devices
