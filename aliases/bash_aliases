@@ -128,3 +128,6 @@ alias claude4.6='claude --model claude-opus-4-6'
 alias clauder4.6='claude --resume --model claude-opus-4-6'
 alias claudeh='claude --model claude-haiku-4-5'
 alias clauderh='claude --resume --model claude-haiku-4-5'
+
+# Docker
+alias docker-desktop='docker info &>/dev/null && open -a "Docker Desktop" || { killall -9 com.docker.backend 2>/dev/null; sleep 1; open -a "Docker Desktop"; }'
