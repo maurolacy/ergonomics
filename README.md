@@ -153,10 +153,16 @@ ai-costs                                  # daily report, all sources
 ai-costs daily --source cursor            # Cursor estimated API cost
 ai-costs monthly -b                       # monthly with per-model breakdown
 ai-costs session --source claude          # per-session (Claude Code)
-ai-costs daily --default-model claude-sonnet-4-6   # assume Cursor "default"
+ai-costs monthly --default-model claude-opus-4-6   # price Cursor "default" as Opus
 ai-costs daily --since 2026-07-01 --json
 ai-costs daily --offline                  # embedded pricing only
 ```
+
+**Cursor tip:** Many chats are stored with model name `default`, which has no
+API price — those rows show as `~$0.00` even when token volume is huge. Pass
+`--default-model` with whatever you usually run (e.g. `claude-opus-4-6` or
+`claude-sonnet-4-6`) to get a meaningful counterfactual. Without it, months
+dominated by `default` look empty.
 
 **Cost markers:**
 
