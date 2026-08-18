@@ -37,12 +37,14 @@ WALKERS = [
     "\U0001F6B6\U0001F3FF",   # 🚶🏿
 ]
 
-# UI element offsets (in screen points, from window origin)
-PROFILE_OFFSET = (987, 17)
+# UI element offsets
+# Profile icon: fixed distance from the top-right corner of the window
+PROFILE_RIGHT_MARGIN = 43   # pixels from the right edge
+PROFILE_TOP_MARGIN = 17     # pixels from the top edge
 # Offsets relative to the profile icon position
 STATUS_MSG_OFFSET = (-80, 240)    # "Set status message" link
 TIMER_DROPDOWN_OFFSET = (-80, 470)  # "Clear status message after" dropdown
-DONE_BTN_OFFSET = (-30, 520)     # Done button (status_msg + (50, 280))
+DONE_BTN_OFFSET = (-30, 520)     # Done button
 
 
 def get_teams_window():
@@ -163,8 +165,8 @@ def set_status(emoji):
     time.sleep(0.5)
 
     wx, wy, ww, wh = get_teams_window()
-    px = wx + PROFILE_OFFSET[0]
-    py = wy + PROFILE_OFFSET[1]
+    px = wx + ww - PROFILE_RIGHT_MARGIN
+    py = wy + PROFILE_TOP_MARGIN
 
     # 1. Click profile icon
     activate_teams()
@@ -207,8 +209,8 @@ def clear_status(quiet=False):
     If no status is set, the hover/click lands harmlessly and the flyout is dismissed.
     """
     wx, wy, ww, wh = get_teams_window()
-    px = wx + PROFILE_OFFSET[0]
-    py = wy + PROFILE_OFFSET[1]
+    px = wx + ww - PROFILE_RIGHT_MARGIN
+    py = wy + PROFILE_TOP_MARGIN
 
     # Status message area (same position as "Set status message" link)
     status_x = px + STATUS_MSG_OFFSET[0]
