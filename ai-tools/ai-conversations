@@ -772,21 +772,46 @@ class ClaudeCodeBackend(Backend):
             return []
         return [d for d in self.PROJECTS_DIR.iterdir() if d.is_dir()]
 
-    def _decode_project_path(self, dirname: str) -> str:
-        """Convert an encoded project dir name back to a filesystem path.
+    _cwd_cache: dict[str, str] = {}
 
-        Claude Code encodes paths by replacing / with -.  The leading - maps to
-        the root /, so "-Users-me-Code-proj" becomes "/Users/me/Code/proj".
+    def _decode_project_path(self, dirname: str) -> str:
+        """Recover the real workspace path for an encoded project directory.
+
+        Claude Code encodes paths by replacing both / and . with -, which is
+        lossy.  We extract the actual `cwd` from the first session file in the
+        project dir (it's stored on every user event) and cache it.  Falls back
+        to the naive slash-replacement when no session file is available.
         """
-        if not dirname.startswith("-"):
-            return dirname
-        return "/" + dirname[1:].replace("-", "/")
+        if dirname in self._cwd_cache:
+            return self._cwd_cache[dirname]
+
+        project_dir = self.PROJECTS_DIR / dirname
+        for sf in self._session_files(project_dir):
+            try:
+                with open(sf, encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        ev = json.loads(line)
+                        cwd = ev.get("cwd")
+                        if cwd:
+                            self._cwd_cache[dirname] = cwd
+                            return cwd
+            except (OSError, json.JSONDecodeError):
+                continue
+
+        fallback = "/" + dirname[1:].replace("-", "/") if dirname.startswith("-") else dirname
+        self._cwd_cache[dirname] = fallback
+        return fallback
 
     def _session_files(self, project_dir: Path) -> list[Path]:
-        sessions_dir = project_dir / "sessions"
-        if not sessions_dir.exists():
-            return []
-        return sorted(sessions_dir.glob("*.jsonl"))
+        files = sorted(project_dir.glob("*.jsonl"))
+        if not files:
+            sessions_dir = project_dir / "sessions"
+            if sessions_dir.exists():
+                files = sorted(sessions_dir.glob("*.jsonl"))
+        return files
 
     def _parse_session(self, session_file: Path) -> tuple[list[dict], dict]:
         """Parse a JSONL session file into (events, metadata)."""
@@ -809,22 +834,24 @@ class ClaudeCodeBackend(Backend):
     def _events_to_messages(self, events: list[dict]) -> list[Message]:
         messages: list[Message] = []
         for ev in events:
-            role = ev.get("role", "")
+            ev_type = ev.get("type", "")
+            if ev_type not in ("user", "human", "assistant", "system"):
+                continue
+
+            msg = ev.get("message", ev)
+            role = msg.get("role", "")
             if not role:
-                ev_type = ev.get("type", "")
                 if ev_type == "human":
                     role = "user"
-                elif ev_type == "assistant":
-                    role = "assistant"
-                elif ev_type == "system":
-                    role = "system"
+                elif ev_type in ("assistant", "system"):
+                    role = ev_type
                 else:
                     continue
 
             content = ""
             thinking = ""
 
-            raw_content = ev.get("content", "")
+            raw_content = msg.get("content", "")
             if isinstance(raw_content, str):
                 content = raw_content
             elif isinstance(raw_content, list):
@@ -871,14 +898,15 @@ class ClaudeCodeBackend(Backend):
         preview = ""
         count = 0
         for ev in events:
-            role = ev.get("role", ev.get("type", ""))
-            if role in ("user", "human", "assistant"):
+            ev_type = ev.get("type", "")
+            if ev_type in ("user", "human", "assistant"):
                 count += 1
             ts = ev.get("timestamp", "")
             if date == "unknown" and ts:
                 date = str(ts)[:10]
-            if not preview and role in ("user", "human"):
-                raw = ev.get("content", "")
+            if not preview and ev_type in ("user", "human"):
+                msg = ev.get("message", ev)
+                raw = msg.get("content", "")
                 text = raw if isinstance(raw, str) else ""
                 if isinstance(raw, list):
                     for block in raw:
@@ -949,50 +977,53 @@ class ClaudeCodeBackend(Backend):
         results: dict[str, list[SearchHit]] = {}
 
         for conv in convs:
-            project_dirs = [
-                d
-                for d in self._project_dirs()
-                if self._decode_project_path(d.name) == conv.workspace
-            ]
-            for pdir in project_dirs:
-                sf = pdir / "sessions" / f"{conv.id}.jsonl"
-                if not sf.exists():
+            sf = self._find_session_file(conv.id)
+            if not sf:
+                continue
+            events, _ = self._parse_session(sf)
+            messages = self._events_to_messages(events)
+            hits: list[SearchHit] = []
+            for msg in messages:
+                if msg.role in ("system",):
                     continue
-                events, _ = self._parse_session(sf)
-                messages = self._events_to_messages(events)
-                hits: list[SearchHit] = []
-                for msg in messages:
-                    if msg.role in ("system",):
-                        continue
-                    search_parts: list[tuple[str, str]] = []
-                    if msg.content and not thinking_only:
-                        search_parts.append(("text", msg.content))
-                    if msg.thinking and not text_only:
-                        search_parts.append(("thinking", msg.thinking))
-                    if msg.tool_args and not thinking_only and not text_only:
-                        search_parts.append(("tool_args", msg.tool_args))
+                search_parts: list[tuple[str, str]] = []
+                if msg.content and not thinking_only:
+                    search_parts.append(("text", msg.content))
+                if msg.thinking and not text_only:
+                    search_parts.append(("thinking", msg.thinking))
+                if msg.tool_args and not thinking_only and not text_only:
+                    search_parts.append(("tool_args", msg.tool_args))
 
-                    for source_type, content in search_parts:
-                        for m in pattern.finditer(content):
-                            hits.append(
-                                SearchHit(
-                                    conversation=conv,
-                                    role=msg.role,
-                                    timestamp=msg.timestamp,
-                                    source_type=source_type,
-                                    context=snippet_around(content, m),
-                                )
+                for source_type, content in search_parts:
+                    for m in pattern.finditer(content):
+                        hits.append(
+                            SearchHit(
+                                conversation=conv,
+                                role=msg.role,
+                                timestamp=msg.timestamp,
+                                source_type=source_type,
+                                context=snippet_around(content, m),
                             )
-                if hits:
-                    results[conv.id] = hits
+                        )
+            if hits:
+                results[conv.id] = hits
         return results
 
-    def get_messages(self, conversation_id: str) -> list[Message]:
+    def _find_session_file(self, conversation_id: str) -> Path | None:
         for pdir in self._project_dirs():
+            sf = pdir / f"{conversation_id}.jsonl"
+            if sf.exists():
+                return sf
             sf = pdir / "sessions" / f"{conversation_id}.jsonl"
             if sf.exists():
-                events, _ = self._parse_session(sf)
-                return self._events_to_messages(events)
+                return sf
+        return None
+
+    def get_messages(self, conversation_id: str) -> list[Message]:
+        sf = self._find_session_file(conversation_id)
+        if sf:
+            events, _ = self._parse_session(sf)
+            return self._events_to_messages(events)
         return []
 
     def export_markdown(self, conversation: Conversation) -> str:
