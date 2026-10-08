@@ -143,8 +143,13 @@ MODEL_ALIASES: dict[str, str] = {
     "gpt-5.3-codex": "gpt-5.3-codex",
     "gpt-5.5": "gpt-5.5",
     "gpt-5": "gpt-5",
+    # Devin model names → canonical pricing keys
+    "claude-opus-4-6-thinking": "claude-opus-4-6",
+    "gpt-5-3-codex-medium": "gpt-5.3-codex",
     # Cursor proprietary — no public API price; left unmapped on purpose
     # "composer-1.5", "composer-2-fast", "composer-2.5", ...
+    # Devin proprietary — no public API price
+    # "swe-1-6", "compactor", "MODEL_PRIVATE_11"
 }
 
 
@@ -589,7 +594,17 @@ class ClaudeCodeBackend(UsageBackend):
 
 
 class DevinBackend(UsageBackend):
-    """Stub — Devin session DB schema for tokens TBD on a machine with Devin installed."""
+    """Read token usage from Devin CLI's local SQLite database.
+
+    Devin stores sessions in ``sessions`` and per-turn messages in
+    ``message_nodes``.  Assistant messages carry a JSON ``chat_message``
+    whose ``metadata.metrics`` object holds per-turn token counts
+    (input, output, cache_read, cache_creation).  The model name lives
+    at ``metadata.generation_model``.
+
+    Like Cursor, Devin is subscription-based — the tool reports tokens and
+    estimates what they would cost under public API pricing.
+    """
 
     name = "devin"
     DB_PATH = Path.home() / ".local/share/devin/cli/sessions.db"
@@ -597,20 +612,106 @@ class DevinBackend(UsageBackend):
     def is_available(self) -> bool:
         return self.DB_PATH.exists()
 
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(f"file:{self.DB_PATH}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _matches_workspace(self, query: str, working_dir: str, extra_dirs: list[str]) -> bool:
+        """Fuzzy workspace match — same logic as Cursor/Claude backends."""
+        all_dirs = [working_dir] + extra_dirs
+        for d in all_dirs:
+            if not d:
+                continue
+            if d == query or d.endswith(query) or query in d or d in query:
+                return True
+        return False
+
     def load_entries(
         self,
         *,
         workspace: str | None = None,
         default_model: str | None = None,
     ) -> list[UsageEntry]:
-        del workspace, default_model
-        # TODO: inspect Devin message / session schema for token or cost fields
-        print(
-            "warning: Devin usage parsing not implemented yet "
-            "(DB found but token fields unknown)",
-            file=sys.stderr,
-        )
-        return []
+        conn = self._connect()
+
+        resolved_ws = str(Path(workspace).expanduser().resolve()) if workspace else None
+
+        # Build session lookup: id → (working_directory, workspace_dirs)
+        sessions: dict[str, tuple[str, list[str]]] = {}
+        for row in conn.execute(
+            "SELECT id, working_directory, workspace_dirs FROM sessions"
+        ):
+            extra: list[str] = []
+            if row["workspace_dirs"]:
+                try:
+                    extra = json.loads(row["workspace_dirs"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            sessions[row["id"]] = (row["working_directory"], extra)
+
+        # Pre-filter sessions by workspace if requested
+        allowed_sessions: set[str] | None = None
+        if resolved_ws:
+            allowed_sessions = set()
+            for sid, (wd, extra) in sessions.items():
+                if self._matches_workspace(resolved_ws, wd, extra):
+                    allowed_sessions.add(sid)
+            if not allowed_sessions:
+                conn.close()
+                return []
+
+        # Query assistant messages with metrics in one pass using json_extract
+        query = """
+            SELECT
+                mn.session_id,
+                json_extract(mn.chat_message, '$.metadata.metrics.input_tokens')          AS input_tokens,
+                json_extract(mn.chat_message, '$.metadata.metrics.output_tokens')         AS output_tokens,
+                json_extract(mn.chat_message, '$.metadata.metrics.cache_read_tokens')     AS cache_read,
+                json_extract(mn.chat_message, '$.metadata.metrics.cache_creation_tokens') AS cache_create,
+                json_extract(mn.chat_message, '$.metadata.generation_model')              AS model,
+                json_extract(mn.chat_message, '$.metadata.created_at')                    AS created_at
+            FROM message_nodes mn
+            WHERE json_extract(mn.chat_message, '$.role') = 'assistant'
+              AND json_extract(mn.chat_message, '$.metadata.metrics') IS NOT NULL
+        """
+        entries: list[UsageEntry] = []
+        for row in conn.execute(query):
+            sid = row["session_id"]
+            if allowed_sessions is not None and sid not in allowed_sessions:
+                continue
+
+            inp = int(row["input_tokens"] or 0)
+            out = int(row["output_tokens"] or 0)
+            cache_r = int(row["cache_read"] or 0)
+            cache_c = int(row["cache_create"] or 0)
+            if inp + out + cache_r + cache_c == 0:
+                continue
+
+            model = row["model"] or "unknown"
+            if model == "default" and default_model:
+                model = default_model
+
+            date = iso_to_date(row["created_at"] or "")
+            wd = sessions.get(sid, ("", []))[0]
+
+            entries.append(
+                UsageEntry(
+                    source=self.name,
+                    date=date,
+                    model=model,
+                    input_tokens=inp,
+                    output_tokens=out,
+                    cache_create_tokens=cache_c,
+                    cache_read_tokens=cache_r,
+                    cost_kind="estimated",  # subscription-based, like Cursor
+                    session_id=sid,
+                    workspace=wd,
+                )
+            )
+
+        conn.close()
+        return entries
 
 
 ALL_BACKENDS: list[UsageBackend] = [
