@@ -8,9 +8,13 @@ public API pricing (the Claude Code / Anthropic / OpenAI billing model).
 Claude Code reports real costs when available (costUSD in the logs), otherwise
 costs are calculated from tokens × API rates.
 
+Cline in VS Code records per-request token counts and real USD costs (as
+reported by the API provider — actual money when routed through OpenRouter).
+
 Usage examples:
     ai-costs                              Daily report (all available sources)
     ai-costs daily --source cursor        Cursor only (estimated API cost)
+    ai-costs daily --source vscode        Cline/VS Code only (real costs)
     ai-costs weekly                       Weekly rollup (ISO weeks)
     ai-costs monthly                      Monthly rollup
     ai-costs session                      Per-session breakdown
@@ -104,6 +108,12 @@ LITELLM_URL = (
     "model_prices_and_context_window.json"
 )
 
+# OpenRouter publishes per-token pricing for every routed model (slugs like
+# "z-ai/glm-5.3-flash") at this public endpoint — no API key required.
+# LiteLLM's table skips keys containing "/", so OpenRouter slugs would
+# otherwise never resolve.
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+
 # Embedded fallback (USD per token). Enough to be useful offline.
 EMBEDDED_PRICING: dict[str, Pricing] = {
     # Anthropic Claude
@@ -186,6 +196,49 @@ class PricingTable:
             loaded += 1
         self._source = f"litellm ({loaded} models)"
         return True
+
+    def load_openrouter(self, timeout: float = 15.0) -> bool:
+        """Add pricing for OpenRouter model slugs ("provider/model").
+
+        USD-per-token strings, straight from OpenRouter's public models
+        endpoint. Only keys not already present are added, so LiteLLM
+        entries win when both exist.
+        """
+        try:
+            req = urllib.request.Request(
+                OPENROUTER_MODELS_URL, headers={"Accept": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read())
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
+            print(f"warning: could not fetch OpenRouter pricing ({e})", file=sys.stderr)
+            return False
+
+        loaded = 0
+        for info in data.get("data", []):
+            if not isinstance(info, dict):
+                continue
+            slug = info.get("id")
+            if not slug or slug in self._prices:
+                continue
+            price = info.get("pricing") or {}
+            try:
+                inp = float(price.get("prompt"))
+                out = float(price.get("completion"))
+            except (TypeError, ValueError):
+                continue
+            if inp < 0 or out < 0:  # -1 means custom/unmetered pricing
+                continue
+            self._prices[slug] = Pricing(
+                input=inp,
+                output=out,
+                cache_create=float(price.get("input_cache_write") or 0.0),
+                cache_read=float(price.get("input_cache_read") or 0.0),
+            )
+            loaded += 1
+        if loaded:
+            self._source = f"{self._source} + openrouter ({loaded} models)"
+        return loaded > 0
 
     @property
     def source(self) -> str:
@@ -715,10 +768,175 @@ class DevinBackend(UsageBackend):
         return entries
 
 
+# ── VS Code (Cline) backend ───────────────────────────────────────────────────
+
+
+class VSCodeBackend(UsageBackend):
+    """Read token usage and real costs from Cline, the VS Code extension.
+
+    Cline stores data in
+    ``~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev``:
+
+    - ``state/taskHistory.json`` — one record per task with cumulative
+      tokens (``tokensIn``/``tokensOut``/``cacheReads``/``cacheWrites``),
+      ``totalCost``, workspace (``cwdOnTaskInitialization``) and the
+      OpenRouter model slug (``modelId``).
+    - ``tasks/<id>/ui_messages.json`` — one ``api_req_started`` record per
+      API request with per-request tokens and the USD cost as reported by
+      the provider.
+
+    When Cline is configured with OpenRouter as provider, those per-request
+    costs are real money actually billed (cost_kind "actual") — like Claude
+    Code, not like the counterfactual Cursor estimates. Tasks whose message
+    history was partially deleted (``conversationHistoryDeletedRange``) fall
+    back to the task-level totals from taskHistory.json, since the per-request
+    records on disk would undercount usage.
+
+    Note: Cline's ``tokensIn`` excludes cached tokens, which are tracked
+    separately in ``cacheReads``/``cacheWrites`` — the same split the tool
+    uses elsewhere, so totals stay additive without double counting.
+    """
+
+    name = "vscode"
+
+    BASE = (
+        Path.home()
+        / "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev"
+    )
+
+    def is_available(self) -> bool:
+        return (self.BASE / "state" / "taskHistory.json").exists()
+
+    def _task_history(self) -> list[dict]:
+        try:
+            data = json.loads((self.BASE / "state" / "taskHistory.json").read_text())
+        except (json.JSONDecodeError, OSError):
+            return []
+        return data if isinstance(data, list) else []
+
+    @staticmethod
+    def _matches_workspace(query: str, cwd: str) -> bool:
+        if not cwd:
+            return False
+        return cwd == query or cwd.endswith(query) or query in cwd or cwd in query
+
+    @staticmethod
+    def _safe_date(ms: object) -> str:
+        try:
+            return epoch_ms_to_date(int(ms))  # type: ignore[arg-type]
+        except (TypeError, ValueError, OSError, OverflowError):
+            return "unknown"
+
+    def _per_request_usage(self, task_id: str) -> list[tuple[int, dict]]:
+        """Return [(ts_ms, usage_dict)] for each API request in a task."""
+        path = self.BASE / "tasks" / task_id / "ui_messages.json"
+        try:
+            msgs = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return []
+        out: list[tuple[int, dict]] = []
+        if not isinstance(msgs, list):
+            return out
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            if m.get("type") != "say" or m.get("say") != "api_req_started":
+                continue
+            try:
+                usage = json.loads(m.get("text") or "{}")
+            except json.JSONDecodeError:
+                continue
+            if isinstance(usage, dict) and "tokensIn" in usage:
+                out.append((m.get("ts") or 0, usage))
+        return out
+
+    def load_entries(
+        self,
+        *,
+        workspace: str | None = None,
+        default_model: str | None = None,
+    ) -> list[UsageEntry]:
+        resolved_ws = str(Path(workspace).expanduser().resolve()) if workspace else None
+
+        entries: list[UsageEntry] = []
+        for task in self._task_history():
+            task_id = str(task.get("id") or "")
+            if not task_id:
+                continue
+            cwd = task.get("cwdOnTaskInitialization") or ""
+            if resolved_ws and not self._matches_workspace(resolved_ws, cwd):
+                continue
+
+            model = task.get("modelId") or "unknown"
+            task_date = self._safe_date(task.get("ts"))
+
+            # Prefer per-request records; fall back to task-level totals when
+            # the message history was deleted (or is missing) because the
+            # remaining per-request records would undercount real usage.
+            deleted = bool(task.get("conversationHistoryDeletedRange"))
+            per_request = self._per_request_usage(task_id)
+
+            if per_request and not deleted:
+                for ts_ms, u in per_request:
+                    inp = int(u.get("tokensIn") or 0)
+                    out = int(u.get("tokensOut") or 0)
+                    cw = int(u.get("cacheWrites") or 0)
+                    cr = int(u.get("cacheReads") or 0)
+                    if inp + out + cw + cr == 0:
+                        continue
+                    cost = u.get("cost")
+                    has_cost = isinstance(cost, (int, float)) and cost is not None
+                    entries.append(
+                        UsageEntry(
+                            source=self.name,
+                            date=(
+                                self._safe_date(ts_ms)
+                                if ts_ms
+                                else task_date
+                            ),
+                            model=model,
+                            input_tokens=inp,
+                            output_tokens=out,
+                            cache_create_tokens=cw,
+                            cache_read_tokens=cr,
+                            cost_usd=float(cost) if has_cost else None,
+                            cost_kind="actual" if has_cost else "calculated",
+                            session_id=task_id,
+                            workspace=cwd,
+                        )
+                    )
+            else:
+                inp = int(task.get("tokensIn") or 0)
+                out = int(task.get("tokensOut") or 0)
+                cw = int(task.get("cacheWrites") or 0)
+                cr = int(task.get("cacheReads") or 0)
+                if inp + out + cw + cr == 0:
+                    continue
+                total = task.get("totalCost")
+                has_cost = isinstance(total, (int, float)) and total is not None
+                entries.append(
+                    UsageEntry(
+                        source=self.name,
+                        date=task_date,
+                        model=model,
+                        input_tokens=inp,
+                        output_tokens=out,
+                        cache_create_tokens=cw,
+                        cache_read_tokens=cr,
+                        cost_usd=float(total) if has_cost else None,
+                        cost_kind="actual" if has_cost else "calculated",
+                        session_id=task_id,
+                        workspace=cwd,
+                    )
+                )
+        return entries
+
+
 ALL_BACKENDS: list[UsageBackend] = [
     CursorBackend(),
     ClaudeCodeBackend(),
     DevinBackend(),
+    VSCodeBackend(),
 ]
 
 
@@ -951,7 +1169,9 @@ def print_table(
     if "unknown" in all_kinds:
         notes.append("? = model has no known API price (e.g. Cursor composer-*, some Grok variants)")
     if "actual" in all_kinds:
-        notes.append("unmarked = actual cost from logs (Claude Code)")
+        notes.append(
+            "unmarked = actual cost from logs (Claude Code costUSD, Cline per-request costs via OpenRouter)"
+        )
     if notes:
         print()
         for n in notes:
@@ -1006,7 +1226,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             cost kinds:
-              actual      Real USD from Claude Code logs (costUSD)
+              actual      Real USD (Claude Code logs, Cline per-request costs
+                          via OpenRouter)
               calculated  Tokens × API price (Claude Code when costUSD missing)
               estimated   Counterfactual API cost for Cursor (subscription)
               unknown     No public price for this model (e.g. composer-*)
@@ -1014,6 +1235,7 @@ def build_parser() -> argparse.ArgumentParser:
             examples:
               %(prog)s                              Daily report, all sources
               %(prog)s daily --source cursor        Cursor estimated API cost
+              %(prog)s daily --source vscode        Cline / OpenRouter real costs
               %(prog)s weekly                       Weekly rollup (ISO weeks)
               %(prog)s monthly -b                   Monthly with per-model breakdown
               %(prog)s session --source claude      Claude sessions
@@ -1031,7 +1253,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "-s", "--source",
-        choices=["cursor", "claude", "devin"],
+        choices=["cursor", "claude", "devin", "vscode"],
         help="Restrict to one AI tool (default: all available)",
     )
     parser.add_argument("-w", "--workspace", help="Filter by workspace path")
@@ -1058,6 +1280,7 @@ def main() -> None:
     pricing = PricingTable()
     if not args.offline:
         pricing.load_litellm()
+        pricing.load_openrouter()
 
     entries: list[UsageEntry] = []
     for b in backends:

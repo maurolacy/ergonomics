@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Search, list, and export AI coding-agent conversations.
 
-Supports multiple backends (Cursor, Devin/Windsurf, Claude Code) and
-auto-detects which are available on the current machine.  All commands
-query every available backend by default; use --source to restrict.
+Supports multiple backends (Cursor, Devin/Windsurf, Claude Code, and
+Cline in VS Code) and auto-detects which are available on the current
+machine.  All commands query every available backend by default; use
+--source to restrict.
 
 Usage examples:
     ai-conversations list                              List all conversations
@@ -47,7 +48,7 @@ from urllib.parse import unquote, urlparse
 @dataclass
 class Conversation:
     id: str
-    source: str  # "cursor", "devin", "claude"
+    source: str  # "cursor", "devin", "claude", "vscode"
     title: str
     date: str  # ISO date for display (YYYY-MM-DD or YYYY-MM-DD HH:MM)
     message_count: int
@@ -1070,9 +1071,269 @@ class ClaudeCodeBackend(Backend):
         return "\n".join(lines)
 
 
+# ── VS Code (Cline) backend ───────────────────────────────────────────────────
+
+
+class VSCodeBackend(Backend):
+    """Cline, the AI coding-agent VS Code extension (``saoudrizwan.claude-dev``).
+
+    Cline keeps task metadata in
+    ``globalStorage/saoudrizwan.claude-dev/state/taskHistory.json`` (one
+    record per task: title, workspace, timestamp) and the full OpenAI-style
+    API conversation per task in ``tasks/<id>/api_conversation_history.json``
+    (typed content parts: text, thinking, tool_use). Tasks whose history was
+    partially deleted (``conversationHistoryDeletedRange``) only return the
+    messages still on disk.
+
+    When Cline is configured with OpenRouter as its provider, ``modelInfo``
+    on assistant messages records the OpenRouter model slug used.
+    """
+
+    name = "vscode"
+    label = "vscode"
+
+    BASE = (
+        Path.home()
+        / "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev"
+    )
+
+    def is_available(self) -> bool:
+        return (self.BASE / "state" / "taskHistory.json").exists()
+
+    def _task_history(self) -> list[dict]:
+        try:
+            data = json.loads((self.BASE / "state" / "taskHistory.json").read_text())
+        except (json.JSONDecodeError, OSError):
+            return []
+        return data if isinstance(data, list) else []
+
+    @staticmethod
+    def _task_workspace(task: dict) -> str:
+        return task.get("cwdOnTaskInitialization") or ""
+
+    @staticmethod
+    def _ts_label(ts: object) -> str:
+        """Format an epoch-ms timestamp defensively (bogus values → '')."""
+        try:
+            return ts_epoch_to_local(int(ts) / 1000)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OSError, OverflowError):
+            return ""
+
+    def _load_history(self, task_id: str) -> list[dict]:
+        path = self.BASE / "tasks" / task_id / "api_conversation_history.json"
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return []
+        return data if isinstance(data, list) else []
+
+    def _conversation_from_task(self, task: dict) -> Conversation:
+        tid = str(task.get("id") or "")
+        date = self._ts_label(task.get("ts")) or "unknown"
+        return Conversation(
+            id=tid,
+            source=self.name,
+            title=str(task.get("task") or tid),
+            date=date,
+            message_count=len(self._load_history(tid)),
+            workspace=self._task_workspace(task),
+        )
+
+    @staticmethod
+    def _message_parts(msg: dict) -> list[tuple[str, str]]:
+        """Flatten an API conversation entry into (kind, text) parts.
+
+        kind is "text", "thinking", "tool_use" or "tool_result".
+        """
+        parts: list[tuple[str, str]] = []
+        content = msg.get("content")
+        if isinstance(content, str):
+            items = [{"type": "text", "text": content}] if content else []
+        elif isinstance(content, list):
+            items = content
+        else:
+            items = []
+        for part in items:
+            if not isinstance(part, dict):
+                continue
+            ptype = part.get("type")
+            if ptype == "text" and part.get("text"):
+                parts.append(("text", part["text"]))
+            elif ptype == "thinking" and part.get("thinking"):
+                parts.append(("thinking", part["thinking"]))
+            elif ptype == "tool_use":
+                try:
+                    args_text = json.dumps(part.get("input"), indent=2)
+                except (TypeError, ValueError):
+                    args_text = str(part.get("input"))
+                name = part.get("name") or "unknown"
+                parts.append(("tool_use", name + ("\n" + args_text if args_text else "")))
+            elif ptype == "tool_result":
+                rc = part.get("content")
+                if isinstance(rc, list):
+                    rc = "\n".join(
+                        p.get("text", "") for p in rc if isinstance(p, dict)
+                    )
+                if rc:
+                    parts.append(("tool_result", str(rc)))
+        return parts
+
+    # -- public interface --
+
+    def list_workspaces(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for task in self._task_history():
+            ws = self._task_workspace(task)
+            if ws:
+                counts[ws] = counts.get(ws, 0) + 1
+        return counts
+
+    def list_conversations(
+        self, *, workspace: str | None = None
+    ) -> list[Conversation]:
+        tasks = self._task_history()
+        if workspace:
+            resolved = self.resolve_workspace(workspace, self.list_workspaces())
+            if not resolved:
+                return []
+            tasks = [t for t in tasks if self._task_workspace(t) == resolved]
+        return [self._conversation_from_task(t) for t in tasks]
+
+    def search(
+        self,
+        pattern: re.Pattern,
+        *,
+        workspace: str | None = None,
+        thinking_only: bool = False,
+        text_only: bool = False,
+    ) -> dict[str, list[SearchHit]]:
+        tasks = self._task_history()
+        if workspace:
+            resolved = self.resolve_workspace(workspace, self.list_workspaces())
+            tasks = (
+                [t for t in tasks if self._task_workspace(t) == resolved]
+                if resolved
+                else []
+            )
+
+        results: dict[str, list[SearchHit]] = {}
+        for task in tasks:
+            tid = str(task.get("id") or "")
+            conv = self._conversation_from_task(task)
+            hits: list[SearchHit] = []
+
+            for msg in self._load_history(tid):
+                role = msg.get("role", "unknown")
+                timestamp = self._ts_label(msg.get("ts"))
+                for source_type, content in self._message_parts(msg):
+                    hit_type = (
+                        source_type if source_type in ("text", "thinking") else "tool_args"
+                    )
+                    if thinking_only and hit_type != "thinking":
+                        continue
+                    if text_only and hit_type != "text":
+                        continue
+                    for m in pattern.finditer(content):
+                        hits.append(
+                            SearchHit(
+                                conversation=conv,
+                                role=role,
+                                timestamp=timestamp,
+                                source_type=hit_type,
+                                context=snippet_around(content, m),
+                            )
+                        )
+            if hits:
+                results[tid] = hits
+        return results
+
+    def get_messages(self, conversation_id: str) -> list[Message]:
+        messages: list[Message] = []
+        for msg in self._load_history(conversation_id):
+            role = msg.get("role", "unknown")
+            timestamp = self._ts_label(msg.get("ts"))
+
+            parts = self._message_parts(msg)
+            content = "\n\n".join(p for k, p in parts if k == "text")
+            thinking = "\n\n".join(p for k, p in parts if k == "thinking")
+            tool_names: list[str] = []
+            tool_args: list[str] = []
+            tool_results: list[str] = []
+            for k, p in parts:
+                if k == "tool_use":
+                    name, _, rest = p.partition("\n")
+                    tool_names.append(name)
+                    tool_args.append(rest)
+                elif k == "tool_result":
+                    tool_results.append(p)
+
+            source_label = {"user": "YOU", "assistant": "CLINE"}.get(role, role.upper())
+            messages.append(
+                Message(
+                    role=role,
+                    content=content,
+                    timestamp=timestamp,
+                    thinking=thinking,
+                    tool_name=" + ".join(tool_names),
+                    tool_args="\n\n".join(tool_args),
+                    tool_result="\n\n".join(tool_results),
+                    source_label=source_label,
+                )
+            )
+        return messages
+
+    def export_markdown(self, conversation: Conversation) -> str:
+        messages = self.get_messages(conversation.id)
+        lines = [
+            f"# {conversation.title}",
+            "",
+            "- **Source:** VS Code (Cline)",
+            f"- **Task ID:** `{conversation.id}`",
+            f"- **Workspace:** `{conversation.workspace}`",
+            f"- **Date:** {conversation.date}",
+            f"- **Messages:** {conversation.message_count}",
+            "",
+            "---",
+            "",
+        ]
+        for msg in messages:
+            if msg.role == "system":
+                continue
+            role_label = msg.source_label or msg.role.upper()
+            lines.append(f"### [{role_label}] {msg.timestamp}")
+            lines.append("")
+            if msg.thinking:
+                lines.append("<details><summary>Thinking</summary>")
+                lines.append("")
+                lines.append(msg.thinking)
+                lines.append("")
+                lines.append("</details>")
+                lines.append("")
+            if msg.content:
+                lines.append(msg.content)
+                lines.append("")
+            if msg.tool_name:
+                lines.append(f"**Tool call:** `{msg.tool_name}`")
+                if msg.tool_args:
+                    lines.append(f"```json\n{msg.tool_args}\n```")
+                lines.append("")
+            if msg.tool_result:
+                lines.append("**Tool result:**")
+                lines.append(f"```\n{msg.tool_result}\n```")
+                lines.append("")
+            lines.append("---")
+            lines.append("")
+        return "\n".join(lines)
+
+
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
-ALL_BACKENDS: list[Backend] = [CursorBackend(), DevinBackend(), ClaudeCodeBackend()]
+ALL_BACKENDS: list[Backend] = [
+    CursorBackend(),
+    DevinBackend(),
+    ClaudeCodeBackend(),
+    VSCodeBackend(),
+]
 
 
 def get_backends(source: str | None = None) -> list[Backend]:
@@ -1336,7 +1597,7 @@ def _do_export(
 
 # ── CLI parser ────────────────────────────────────────────────────────────────
 
-SOURCE_NAMES = "cursor, devin, claude"
+SOURCE_NAMES = "cursor, devin, claude, vscode"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1367,7 +1628,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "-s", "--source",
-        choices=["cursor", "devin", "claude"],
+        choices=["cursor", "devin", "claude", "vscode"],
         help="Restrict to a specific AI tool (default: all available)",
     )
     sub = parser.add_subparsers(dest="command", required=True)

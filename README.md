@@ -105,7 +105,7 @@ A unified CLI for searching, listing, and exporting conversations from
 AI coding agents. Auto-detects which tools are installed and queries all
 of them by default.
 
-**Supported backends:** Cursor, Devin/Windsurf, Claude Code
+**Supported backends:** Cursor, Devin/Windsurf, Claude Code, VS Code (Cline)
 
 ```
 ai-conversations list                         # list all conversations
@@ -128,7 +128,7 @@ ai-conversations export -o exported/          # export all to markdown
 - Search inside thinking blocks (`--thinking`) or visible text only (`--text`)
 - Fuzzy workspace matching (partial paths work)
 - Exported markdown includes thinking in `<details>` blocks, tool calls, and results
-- `--source cursor|devin|claude` to restrict scope
+- `--source cursor|devin|claude|vscode` to restrict scope
 
 **Install:**
 
@@ -146,7 +146,11 @@ so the tool reports tokens and a **counterfactual** estimate: what those
 tokens would have cost under public API pricing — especially useful when
 running Claude models through Cursor.
 
-**Supported backends:** Cursor, Claude Code, Devin (stub)
+**Supported backends:** Cursor, Claude Code, Devin, VS Code (Cline)
+
+Cline records per-request token counts and real USD costs (as reported by
+the API provider — actual money when routed through OpenRouter), so its
+costs are actual, not estimated.
 
 ```
 ai-costs                                  # daily report, all sources
@@ -166,7 +170,7 @@ dominated by `default` look empty.
 
 **Cost markers:**
 
-- unmarked — actual cost from Claude Code logs
+- unmarked — actual cost from Claude Code logs or Cline per-request costs (OpenRouter)
 - `~` — estimated / counterfactual API cost (Cursor)
 - `?` — model has no known public API price (e.g. `composer-*`)
 
@@ -175,7 +179,8 @@ For those chats the tool falls back to context-window snapshots, which
 undercount real cumulative usage.
 
 **Prerequisites:** Python 3.10+, no external dependencies (stdlib only).
-Live pricing is fetched from LiteLLM unless `--offline` is set.
+Live pricing is fetched from LiteLLM and OpenRouter's public models endpoint
+unless `--offline` is set.
 
 **Credits:** Claude Code log layout, report shapes (daily / monthly / session),
 cache-token handling, and LiteLLM-backed pricing ideas come from
@@ -221,17 +226,20 @@ your `~/.bashrc` — `bashrc_base` only manages the portable parts.
 
 - **ai-conversations:** Every AI tool stores conversations in its own
   format and location. Cursor uses SQLite with "bubbles" keyed by composer
-  IDs, Devin uses SQLite with a linked-list message chain, and Claude Code
-  uses JSONL session files. To make matters worse, newer IDE versions are
-  removing their built-in transcript export features entirely. This tool
-  wraps all three behind a single interface so you can search, export, and
-  own your conversation history regardless of which tool you used or what
-  the vendor decides to ship next.
+  IDs, Devin uses SQLite with a linked-list message chain, Claude Code
+  uses JSONL session files, and Cline in VS Code splits tasks across a
+  JSON task history and per-task API conversation files. To make matters
+  worse, newer IDE versions are removing their built-in transcript export
+  features entirely. This tool wraps them all behind a single interface so
+  you can search, export, and own your conversation history regardless of
+  which tool you used or what the vendor decides to ship next.
 
 - **ai-costs:** Claude Code bills per token; Cursor is a flat subscription
   that hides real usage economics. This tool surfaces tokens for both and
   estimates what Cursor usage would cost under API pricing — so you can
   answer "am I getting my money's worth?" when running Claude through Cursor.
+  Cline in VS Code (routed through OpenRouter) reports the real money spent
+  per request, which this tool surfaces directly.
 
 - **out_for_a_walk:** Microsoft's Conditional Access policies block API
   access via the Graph API device code flow from unmanaged devices
