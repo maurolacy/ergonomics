@@ -11,6 +11,7 @@ costs are calculated from tokens × API rates.
 Usage examples:
     ai-costs                              Daily report (all available sources)
     ai-costs daily --source cursor        Cursor only (estimated API cost)
+    ai-costs weekly                       Weekly rollup (ISO weeks)
     ai-costs monthly                      Monthly rollup
     ai-costs session                      Per-session breakdown
     ai-costs daily -w ~/Projects/foo      Filter by workspace
@@ -780,16 +781,31 @@ def filter_entries(
     return out
 
 
+def _iso_week(date_str: str) -> str:
+    """Convert YYYY-MM-DD to ISO week label 'YYYY-Www' (e.g. '2026-W41')."""
+    if date_str == "unknown" or len(date_str) < 10:
+        return "unknown"
+    try:
+        dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+        iso_year, iso_week, _ = dt.isocalendar()
+        return f"{iso_year}-W{iso_week:02d}"
+    except ValueError:
+        return "unknown"
+
+
 def aggregate(
     entries: list[UsageEntry],
     *,
-    group_by: str,  # "daily" | "monthly" | "session"
+    group_by: str,  # "daily" | "weekly" | "monthly" | "session"
 ) -> list[PeriodSummary]:
     buckets: dict[tuple, PeriodSummary] = {}
 
     for e in entries:
         if group_by == "daily":
             period = e.date
+            key = (period, e.source)
+        elif group_by == "weekly":
+            period = _iso_week(e.date)
             key = (period, e.source)
         elif group_by == "monthly":
             period = e.date[:7] if e.date != "unknown" else "unknown"
@@ -998,6 +1014,7 @@ def build_parser() -> argparse.ArgumentParser:
             examples:
               %(prog)s                              Daily report, all sources
               %(prog)s daily --source cursor        Cursor estimated API cost
+              %(prog)s weekly                       Weekly rollup (ISO weeks)
               %(prog)s monthly -b                   Monthly with per-model breakdown
               %(prog)s session --source claude      Claude sessions
               %(prog)s daily --since 2026-07-01
@@ -1009,7 +1026,7 @@ def build_parser() -> argparse.ArgumentParser:
         "report",
         nargs="?",
         default="daily",
-        choices=["daily", "monthly", "session"],
+        choices=["daily", "weekly", "monthly", "session"],
         help="Report type (default: daily)",
     )
     parser.add_argument(
