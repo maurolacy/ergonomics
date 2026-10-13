@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+"""Persistent AI context memory — the bitácora.
+
+Ingests exported AI conversations (from ai-conversations export), sends them
+through an LLM for structured extraction, and stores the results in a local
+SQLite database.  Entries are categorised as Decisions, Discoveries, State, or
+Contacts, and are queryable by project, category, date, and free text.
+
+The LLM step can use Anthropic (Claude) or OpenRouter (open-source models).
+Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY accordingly.
+
+Usage examples:
+    ai-context ingest exported/                   Ingest all markdown exports
+    ai-context ingest exported/20261013_devin_*.md  Ingest specific files
+    ai-context ingest --auto                      Export + ingest in one step
+    ai-context ingest --auto -w ~/work/PSA        Auto-ingest for a workspace
+
+    ai-context query "credstore"                  Full-text search
+    ai-context query --category decision          Filter by category
+    ai-context query --project cyber-psa          Filter by project
+    ai-context query --since 2026-10-01           Date filter
+
+    ai-context show 42                            Show entry details
+    ai-context stats                              Summary of the database
+
+    ai-context providers                          Show available LLM providers
+
+Options:
+    --provider anthropic|openrouter       LLM provider (default: auto-detect from keys)
+    --model MODEL                         Model name (default: provider-specific)
+    --db PATH                             Database path (default: ~/.local/share/ai-context/bitacora.db)
+    --dry-run                             Show what would be ingested, don't call LLM
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import textwrap
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+# ── Data model ────────────────────────────────────────────────────────────────
+
+CATEGORIES = ("decision", "discovery", "state", "contact")
+
+@dataclass
+class Entry:
+    id: int | None
+    category: str           # decision | discovery | state | contact
+    project: str            # e.g. "cyber-psa-backend", "ergonomics", "gears-rust"
+    title: str              # short summary
+    content: str            # full detail
+    tags: list[str] = field(default_factory=list)
+    source_session: str = ""    # session id or filename
+    source_tool: str = ""       # devin | claude | cursor | vscode
+    conversation_date: str = "" # YYYY-MM-DD from the source conversation
+    created_at: str = ""        # ISO timestamp when ingested
+
+
+# ── Database ──────────────────────────────────────────────────────────────────
+
+DEFAULT_DB = Path.home() / ".local/share/ai-context/bitacora.db"
+
+SCHEMA_SQL = """\
+CREATE TABLE IF NOT EXISTS entries (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    category          TEXT NOT NULL CHECK (category IN ('decision', 'discovery', 'state', 'contact')),
+    project           TEXT NOT NULL DEFAULT '',
+    title             TEXT NOT NULL,
+    content           TEXT NOT NULL,
+    tags              TEXT NOT NULL DEFAULT '[]',       -- JSON array
+    source_session    TEXT NOT NULL DEFAULT '',
+    source_tool       TEXT NOT NULL DEFAULT '',
+    conversation_date TEXT NOT NULL DEFAULT '',
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS ingestion_log (
+    file_hash    TEXT PRIMARY KEY,
+    filename     TEXT NOT NULL,
+    ingested_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    entry_count  INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+    title, content, tags, project,
+    content='entries',
+    content_rowid='id'
+);
+
+-- Triggers to keep FTS in sync
+CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN
+    INSERT INTO entries_fts(rowid, title, content, tags, project)
+    VALUES (new.id, new.title, new.content, new.tags, new.project);
+END;
+
+CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
+    INSERT INTO entries_fts(entries_fts, rowid, title, content, tags, project)
+    VALUES ('delete', old.id, old.title, old.content, old.tags, old.project);
+END;
+
+CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries BEGIN
+    INSERT INTO entries_fts(entries_fts, rowid, title, content, tags, project)
+    VALUES ('delete', old.id, old.title, old.content, old.tags, old.project);
+    INSERT INTO entries_fts(rowid, title, content, tags, project)
+    VALUES (new.id, new.title, new.content, new.tags, new.project);
+END;
+"""
+
+
+def open_db(path: Path) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(SCHEMA_SQL)
+    return conn
+
+
+def file_hash(path: Path) -> str:
+    h = hashlib.sha256()
+    h.update(path.read_bytes())
+    return h.hexdigest()
+
+
+def is_already_ingested(conn: sqlite3.Connection, fhash: str) -> bool:
+    row = conn.execute("SELECT 1 FROM ingestion_log WHERE file_hash = ?", (fhash,)).fetchone()
+    return row is not None
+
+
+def record_ingestion(conn: sqlite3.Connection, fhash: str, filename: str, count: int) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO ingestion_log (file_hash, filename, entry_count) VALUES (?, ?, ?)",
+        (fhash, filename, count),
+    )
+    conn.commit()
+
+
+def insert_entries(conn: sqlite3.Connection, entries: list[Entry]) -> int:
+    inserted = 0
+    for e in entries:
+        conn.execute(
+            """INSERT INTO entries (category, project, title, content, tags,
+               source_session, source_tool, conversation_date)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                e.category,
+                e.project,
+                e.title,
+                e.content,
+                json.dumps(e.tags),
+                e.source_session,
+                e.source_tool,
+                e.conversation_date,
+            ),
+        )
+        inserted += 1
+    conn.commit()
+    return inserted
+
+
+# ── LLM providers ────────────────────────────────────────────────────────────
+
+CATEGORIZATION_PROMPT = """\
+You are a knowledge extraction assistant.  You read AI coding-assistant
+conversation transcripts and extract structured knowledge entries.
+
+For each conversation, extract entries in these categories:
+
+1. **decision** — A choice that was made, with rationale and alternatives
+   considered.  Examples: "chose library X over Y because ...",
+   "decided to use OData for filtering instead of custom query params".
+
+2. **discovery** — Codebase or infrastructure knowledge that is expensive to
+   re-learn.  Examples: "credstore 0.3.2 requires `database.servers` in
+   config", "the toolkit openapi `exposed` field controls gateway routing".
+
+3. **contact** — People, roles, team dynamics, ownership.  Examples:
+   "Alex is the PM for alert-automation", "PR reviewer insisted on squash".
+
+4. **state** — In-flight work, blockers, branch status, deployment info.
+   Examples: "deployed build 5bbe14790 to clients-200826",
+   "PLTFRM-95212 blocked on PM clarification of 'requires attention' query".
+
+Rules:
+- Extract ONLY substantive entries — skip greetings, meta-discussion, tool
+  output noise, and trivial exchanges.
+- Each entry needs: category, project (infer from workspace/repo name),
+  a short title (≤80 chars), detailed content, and relevant tags.
+- For the project field, use the repository/project short name (e.g.
+  "cyber-psa-backend", "ergonomics", "gears-rust").  If unclear, use "unknown".
+- Tags should be lowercase, specific terms (e.g. "odata", "deployment",
+  "credstore", "ai-attrs", "docker").
+- Be thorough but precise — prefer fewer high-quality entries over many vague ones.
+- If no meaningful entries can be extracted, return an empty array.
+
+Return ONLY a JSON array of objects with these fields:
+```json
+[
+  {
+    "category": "decision",
+    "project": "cyber-psa-backend",
+    "title": "Short title here",
+    "content": "Detailed description of what was decided/discovered/etc.",
+    "tags": ["tag1", "tag2"]
+  }
+]
+```
+
+No markdown fences around the JSON.  No explanation text.  Just the JSON array.
+"""
+
+
+def detect_provider() -> str:
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return "openrouter"
+    return ""
+
+
+DEFAULT_MODELS = {
+    "anthropic": "claude-sonnet-4-20250514",
+    "openrouter": "qwen/qwen3-32b",
+}
+
+
+def llm_extract(text: str, provider: str, model: str) -> list[dict]:
+    """Send conversation text to LLM and get structured entries back."""
+    if provider == "anthropic":
+        return _call_anthropic(text, model)
+    elif provider == "openrouter":
+        return _call_openrouter(text, model)
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
+
+
+def _call_anthropic(text: str, model: str) -> list[dict]:
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        print("Error: ANTHROPIC_API_KEY not set.", file=sys.stderr)
+        sys.exit(1)
+
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 8192,
+        "system": CATEGORIZATION_PROMPT,
+        "messages": [{"role": "user", "content": text}],
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+    return _do_request(req)
+
+
+def _call_openrouter(text: str, model: str) -> list[dict]:
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        print("Error: OPENROUTER_API_KEY not set.", file=sys.stderr)
+        sys.exit(1)
+
+    body = json.dumps({
+        "model": model,
+        "max_tokens": 8192,
+        "messages": [
+            {"role": "system", "content": CATEGORIZATION_PROMPT},
+            {"role": "user", "content": text},
+        ],
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    return _do_request(req, openai_format=True)
+
+
+def _do_request(req: urllib.request.Request, openai_format: bool = False) -> list[dict]:
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        print(f"LLM API error {e.code}: {body[:500]}", file=sys.stderr)
+        return []
+    except urllib.error.URLError as e:
+        print(f"LLM API connection error: {e.reason}", file=sys.stderr)
+        return []
+
+    # Extract text from response
+    if openai_format:
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    else:
+        # Anthropic format
+        blocks = data.get("content", [])
+        text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+
+    return _parse_json_array(text)
+
+
+def _parse_json_array(text: str) -> list[dict]:
+    """Parse a JSON array from LLM output, tolerating markdown fences."""
+    text = text.strip()
+    # Strip markdown code fences if present
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # Remove first and last fence lines
+        if lines[-1].strip() == "```":
+            lines = lines[1:-1]
+        else:
+            lines = lines[1:]
+        text = "\n".join(lines).strip()
+
+    try:
+        result = json.loads(text)
+        if isinstance(result, list):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # Try to find a JSON array in the text
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if match:
+        try:
+            result = json.loads(match.group())
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+    print(f"Warning: could not parse LLM output as JSON array.", file=sys.stderr)
+    if text:
+        print(f"  First 200 chars: {text[:200]}", file=sys.stderr)
+    return []
+
+
+# ── Conversation parsing ─────────────────────────────────────────────────────
+
+def parse_export_metadata(text: str) -> dict:
+    """Extract metadata from an ai-conversations export markdown header."""
+    meta = {}
+    for line in text.split("\n")[:20]:
+        if line.startswith("- **Source:**"):
+            meta["source_tool"] = line.split("**Source:**")[1].strip().lower()
+        elif line.startswith("- **Session ID:**"):
+            meta["source_session"] = line.split("`")[1] if "`" in line else ""
+        elif line.startswith("- **Composer ID:**"):
+            meta["source_session"] = line.split("`")[1] if "`" in line else ""
+        elif line.startswith("- **Workspace:**"):
+            meta["workspace"] = line.split("`")[1] if "`" in line else ""
+        elif line.startswith("- **Date:**"):
+            meta["conversation_date"] = line.split("**Date:**")[1].strip()[:10]
+        elif line.startswith("# "):
+            meta["title"] = line[2:].strip()
+    return meta
+
+
+def chunk_conversation(text: str, max_chars: int = 80_000) -> list[str]:
+    """Split a long conversation into chunks that fit in an LLM context window.
+
+    Splits on message boundaries (### [...] lines) to keep messages intact.
+    Each chunk includes the header metadata for context.
+    """
+    lines = text.split("\n")
+
+    # Find the header (everything before the first --- separator after metadata)
+    header_end = 0
+    sep_count = 0
+    for i, line in enumerate(lines):
+        if line.strip() == "---":
+            sep_count += 1
+            if sep_count == 1:
+                header_end = i + 1
+                break
+    header = "\n".join(lines[:header_end])
+
+    # If it fits in one chunk, return as-is
+    if len(text) <= max_chars:
+        return [text]
+
+    # Split on message boundaries
+    chunks = []
+    current_lines = []
+    current_len = len(header)
+
+    for line in lines[header_end:]:
+        line_len = len(line) + 1
+        if (
+            line.startswith("### [")
+            and current_len + line_len > max_chars
+            and current_lines
+        ):
+            chunks.append(header + "\n" + "\n".join(current_lines))
+            current_lines = []
+            current_len = len(header)
+
+        current_lines.append(line)
+        current_len += line_len
+
+    if current_lines:
+        chunks.append(header + "\n" + "\n".join(current_lines))
+
+    return chunks
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_ingest(args: argparse.Namespace) -> None:
+    provider = args.provider or detect_provider()
+    if not provider and not args.dry_run:
+        print("Error: No LLM provider available.", file=sys.stderr)
+        print("Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY.", file=sys.stderr)
+        sys.exit(1)
+
+    model = args.model or DEFAULT_MODELS.get(provider, "")
+
+    # Collect input files
+    files = _collect_input_files(args)
+    if not files:
+        print("No files to ingest.")
+        return
+
+    conn = open_db(Path(args.db))
+
+    # Filter already-ingested
+    new_files = []
+    for f in files:
+        fh = file_hash(f)
+        if is_already_ingested(conn, fh):
+            print(f"  [skip] {f.name} (already ingested)")
+        else:
+            new_files.append((f, fh))
+
+    if not new_files:
+        print("All files already ingested.")
+        return
+
+    print(f"\nIngesting {len(new_files)} file(s) via {provider}/{model}\n")
+
+    total_entries = 0
+    for fpath, fhash in new_files:
+        text = fpath.read_text(encoding="utf-8", errors="replace")
+        meta = parse_export_metadata(text)
+        chunks = chunk_conversation(text)
+
+        print(f"  [{meta.get('source_tool', '?')}] {fpath.name} ({len(chunks)} chunk(s))", end="")
+        sys.stdout.flush()
+
+        if args.dry_run:
+            print(" [dry-run]")
+            continue
+
+        all_raw_entries = []
+        for i, chunk in enumerate(chunks):
+            raw = llm_extract(chunk, provider, model)
+            all_raw_entries.extend(raw)
+            if len(chunks) > 1:
+                # Rate-limit between chunks
+                time.sleep(1)
+
+        # Convert to Entry objects
+        entries = []
+        for raw_entry in all_raw_entries:
+            cat = raw_entry.get("category", "").lower()
+            if cat not in CATEGORIES:
+                continue
+            entries.append(Entry(
+                id=None,
+                category=cat,
+                project=raw_entry.get("project", "unknown"),
+                title=raw_entry.get("title", "")[:200],
+                content=raw_entry.get("content", ""),
+                tags=raw_entry.get("tags", []),
+                source_session=meta.get("source_session", ""),
+                source_tool=meta.get("source_tool", ""),
+                conversation_date=meta.get("conversation_date", ""),
+            ))
+
+        count = insert_entries(conn, entries)
+        record_ingestion(conn, fhash, fpath.name, count)
+        total_entries += count
+        print(f" -> {count} entries")
+
+    conn.close()
+    print(f"\nDone. {total_entries} entries added to the bitácora.")
+
+
+def _collect_input_files(args: argparse.Namespace) -> list[Path]:
+    """Gather markdown files to ingest."""
+    if getattr(args, "auto", False):
+        return _auto_export(args)
+
+    paths = getattr(args, "files", []) or []
+    result = []
+    for p in paths:
+        path = Path(p)
+        if path.is_dir():
+            result.extend(sorted(path.glob("*.md")))
+        elif path.is_file() and path.suffix == ".md":
+            result.append(path)
+        else:
+            print(f"  [skip] {p} (not a .md file or directory)", file=sys.stderr)
+    return result
+
+
+def _auto_export(args: argparse.Namespace) -> list[Path]:
+    """Run ai-conversations export and return the exported files."""
+    import tempfile
+
+    export_dir = Path(tempfile.mkdtemp(prefix="ai-context-"))
+    cmd = ["ai-conversations", "export", "-o", str(export_dir)]
+    if args.workspace:
+        cmd.extend(["-w", args.workspace])
+    if args.source:
+        cmd.extend(["--source", args.source])
+
+    print(f"Auto-exporting conversations to {export_dir}/ ...")
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except FileNotFoundError:
+        print("Error: ai-conversations not found in PATH.", file=sys.stderr)
+        return []
+    except subprocess.CalledProcessError as e:
+        print(f"Error running ai-conversations: {e.stderr}", file=sys.stderr)
+        return []
+
+    files = sorted(export_dir.glob("*.md"))
+    # Exclude summaries subdir
+    files = [f for f in files if f.parent == export_dir]
+    print(f"Exported {len(files)} conversation(s).\n")
+    return files
+
+
+def cmd_query(args: argparse.Namespace) -> None:
+    conn = open_db(Path(args.db))
+
+    if args.term:
+        # Full-text search
+        sql = """
+            SELECT e.id, e.category, e.project, e.title,
+                   e.conversation_date, e.source_tool, e.tags
+            FROM entries_fts fts
+            JOIN entries e ON e.id = fts.rowid
+            WHERE entries_fts MATCH ?
+        """
+        params: list = [args.term]
+    else:
+        sql = """
+            SELECT id, category, project, title,
+                   conversation_date, source_tool, tags
+            FROM entries WHERE 1=1
+        """
+        params = []
+
+    if args.category:
+        sql += " AND category = ?"
+        params.append(args.category)
+    if args.project:
+        sql += " AND project LIKE ?"
+        params.append(f"%{args.project}%")
+    if args.since:
+        sql += " AND conversation_date >= ?"
+        params.append(args.since)
+
+    sql += " ORDER BY conversation_date DESC, id DESC"
+
+    limit = args.limit or 50
+    sql += f" LIMIT {limit}"
+
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    if not rows:
+        print("No entries found.")
+        return
+
+    # Display
+    print(f"{'ID':>5}  {'Cat':10}  {'Project':20}  {'Date':12}  {'Source':8}  Title")
+    print("─" * 100)
+    for r in rows:
+        tags = json.loads(r["tags"]) if r["tags"] else []
+        tag_str = f"  [{', '.join(tags[:3])}]" if tags else ""
+        print(
+            f"{r['id']:>5}  {r['category']:10}  {r['project']:20}  "
+            f"{r['conversation_date']:12}  {r['source_tool']:8}  "
+            f"{r['title'][:60]}{tag_str}"
+        )
+
+    if len(rows) == limit:
+        print(f"\n(showing first {limit} — use --limit N for more)")
+
+
+def cmd_show(args: argparse.Namespace) -> None:
+    conn = open_db(Path(args.db))
+    row = conn.execute("SELECT * FROM entries WHERE id = ?", (args.entry_id,)).fetchone()
+    conn.close()
+
+    if not row:
+        print(f"Entry {args.entry_id} not found.")
+        sys.exit(1)
+
+    tags = json.loads(row["tags"]) if row["tags"] else []
+    print(f"ID:         {row['id']}")
+    print(f"Category:   {row['category']}")
+    print(f"Project:    {row['project']}")
+    print(f"Title:      {row['title']}")
+    print(f"Source:     {row['source_tool']} / {row['source_session']}")
+    print(f"Date:       {row['conversation_date']}")
+    print(f"Ingested:   {row['created_at']}")
+    print(f"Tags:       {', '.join(tags)}")
+    print()
+    print(row["content"])
+
+
+def cmd_stats(args: argparse.Namespace) -> None:
+    conn = open_db(Path(args.db))
+
+    total = conn.execute("SELECT COUNT(*) as n FROM entries").fetchone()["n"]
+    if total == 0:
+        print("The bitácora is empty. Run `ai-context ingest` to populate it.")
+        return
+
+    print(f"Total entries: {total}\n")
+
+    # By category
+    print("By category:")
+    for row in conn.execute(
+        "SELECT category, COUNT(*) as n FROM entries GROUP BY category ORDER BY n DESC"
+    ):
+        print(f"  {row['category']:12} {row['n']:>5}")
+
+    # By project
+    print("\nBy project:")
+    for row in conn.execute(
+        "SELECT project, COUNT(*) as n FROM entries GROUP BY project ORDER BY n DESC LIMIT 15"
+    ):
+        print(f"  {row['project']:25} {row['n']:>5}")
+
+    # By source tool
+    print("\nBy source:")
+    for row in conn.execute(
+        "SELECT source_tool, COUNT(*) as n FROM entries GROUP BY source_tool ORDER BY n DESC"
+    ):
+        print(f"  {row['source_tool']:12} {row['n']:>5}")
+
+    # Date range
+    date_range = conn.execute(
+        "SELECT MIN(conversation_date) as mn, MAX(conversation_date) as mx FROM entries"
+    ).fetchone()
+    if date_range["mn"]:
+        print(f"\nDate range:  {date_range['mn']}  to  {date_range['mx']}")
+
+    # Ingestion log
+    ingestions = conn.execute("SELECT COUNT(*) as n FROM ingestion_log").fetchone()["n"]
+    print(f"Files ingested: {ingestions}")
+
+    conn.close()
+
+
+def cmd_providers(args: argparse.Namespace) -> None:
+    print("Available LLM providers:\n")
+
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+
+    print(f"  anthropic    {'[key set]' if anthropic_key else '[no key]':12}  "
+          f"Default model: {DEFAULT_MODELS['anthropic']}")
+    print(f"  openrouter   {'[key set]' if openrouter_key else '[no key]':12}  "
+          f"Default model: {DEFAULT_MODELS['openrouter']}")
+
+    detected = detect_provider()
+    if detected:
+        print(f"\nAuto-detected: {detected}")
+    else:
+        print("\nNo API keys found. Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY.")
+
+
+def cmd_forget(args: argparse.Namespace) -> None:
+    """Remove entries by ID or clear ingestion log for re-processing."""
+    conn = open_db(Path(args.db))
+
+    if args.entry_id:
+        conn.execute("DELETE FROM entries WHERE id = ?", (args.entry_id,))
+        conn.commit()
+        print(f"Deleted entry {args.entry_id}.")
+    elif args.file:
+        # Clear ingestion record so the file can be re-ingested
+        fpath = Path(args.file)
+        if fpath.exists():
+            fh = file_hash(fpath)
+            conn.execute("DELETE FROM ingestion_log WHERE file_hash = ?", (fh,))
+            conn.commit()
+            print(f"Cleared ingestion record for {fpath.name}. It will be re-processed on next ingest.")
+        else:
+            # Try matching by filename
+            conn.execute("DELETE FROM ingestion_log WHERE filename = ?", (args.file,))
+            conn.commit()
+            print(f"Cleared ingestion record for {args.file}.")
+    elif args.reset:
+        count = conn.execute("SELECT COUNT(*) as n FROM entries").fetchone()["n"]
+        conn.execute("DELETE FROM entries")
+        conn.execute("DELETE FROM ingestion_log")
+        conn.execute("DELETE FROM entries_fts")
+        conn.commit()
+        print(f"Reset complete. Removed {count} entries and all ingestion records.")
+    else:
+        print("Specify --id, --file, or --reset.")
+
+    conn.close()
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ai-context",
+        description="Persistent AI context memory — the bitácora",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--db", default=str(DEFAULT_DB),
+        help=f"Database path (default: {DEFAULT_DB})",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # ingest
+    p_ingest = sub.add_parser("ingest", help="Ingest conversation exports")
+    p_ingest.add_argument("files", nargs="*", help="Markdown files or directories to ingest")
+    p_ingest.add_argument("--auto", action="store_true",
+                          help="Auto-export from ai-conversations, then ingest")
+    p_ingest.add_argument("-w", "--workspace", help="Filter workspace (with --auto)")
+    p_ingest.add_argument("-s", "--source", help="Filter source (with --auto): devin, cursor, claude, vscode")
+    p_ingest.add_argument("--provider", choices=["anthropic", "openrouter"],
+                          help="LLM provider")
+    p_ingest.add_argument("--model", help="LLM model name")
+    p_ingest.add_argument("--dry-run", action="store_true",
+                          help="Show what would be ingested without calling LLM")
+
+    # query
+    p_query = sub.add_parser("query", help="Search the bitácora")
+    p_query.add_argument("term", nargs="?", help="Search term (FTS5 syntax)")
+    p_query.add_argument("--category", "-c", choices=CATEGORIES, help="Filter by category")
+    p_query.add_argument("--project", "-p", help="Filter by project name")
+    p_query.add_argument("--since", help="Show entries from this date (YYYY-MM-DD)")
+    p_query.add_argument("--limit", "-n", type=int, help="Max results (default: 50)")
+
+    # show
+    p_show = sub.add_parser("show", help="Show entry details")
+    p_show.add_argument("entry_id", type=int, help="Entry ID")
+
+    # stats
+    sub.add_parser("stats", help="Database statistics")
+
+    # providers
+    sub.add_parser("providers", help="Show available LLM providers")
+
+    # forget
+    p_forget = sub.add_parser("forget", help="Remove entries or reset ingestion")
+    p_forget.add_argument("--id", dest="entry_id", type=int, help="Delete entry by ID")
+    p_forget.add_argument("--file", help="Clear ingestion record for a file")
+    p_forget.add_argument("--reset", action="store_true", help="Reset entire database")
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    cmd_map = {
+        "ingest": cmd_ingest,
+        "query": cmd_query,
+        "show": cmd_show,
+        "stats": cmd_stats,
+        "providers": cmd_providers,
+        "forget": cmd_forget,
+    }
+    cmd_map[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
