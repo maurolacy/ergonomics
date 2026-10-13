@@ -1075,73 +1075,252 @@ class ClaudeCodeBackend(Backend):
 
 
 class VSCodeBackend(Backend):
-    """Cline, the AI coding-agent VS Code extension (``saoudrizwan.claude-dev``).
+    """Cline — the AI coding agent for VS Code.
 
-    Cline keeps task metadata in
-    ``globalStorage/saoudrizwan.claude-dev/state/taskHistory.json`` (one
-    record per task: title, workspace, timestamp) and the full OpenAI-style
-    API conversation per task in ``tasks/<id>/api_conversation_history.json``
-    (typed content parts: text, thinking, tool_use). Tasks whose history was
-    partially deleted (``conversationHistoryDeletedRange``) only return the
-    messages still on disk.
+    Reads two on-disk formats, merged and deduped by session id:
 
-    When Cline is configured with OpenRouter as its provider, ``modelInfo``
-    on assistant messages records the OpenRouter model slug used.
+    - Current (Cline >= 4): ``~/.cline/data`` — ``db/sessions.db`` (SQLite
+      session index: model, cwd, workspace_root, started_at, messages
+      path), ``sessions/<id>/<id>.json`` (title, token/cost totals) and
+      ``sessions/<id>/<id>.messages.json`` (full message log; assistant
+      messages carry per-request ``metrics`` including the real USD cost
+      reported by the API provider, e.g. OpenRouter).
+    - Legacy (older extension versions):
+      ``globalStorage/saoudrizwan.claude-dev`` — ``state/taskHistory.json``
+      plus per-task ``tasks/<id>/ui_messages.json`` and
+      ``api_conversation_history.json``.
+
+    The message log uses the same shape in both formats: OpenAI-style
+    entries with typed content parts (text, thinking, tool_use). Tasks
+    whose history was partially deleted (``conversationHistoryDeletedRange``)
+    only return the messages still on disk.
     """
 
     name = "vscode"
     label = "vscode"
 
-    BASE = (
+    DATA = Path.home() / ".cline/data"
+    LEGACY = (
         Path.home()
         / "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev"
     )
 
     def is_available(self) -> bool:
-        return (self.BASE / "state" / "taskHistory.json").exists()
+        return (self.DATA / "db" / "sessions.db").exists() or (
+            self.LEGACY / "state" / "taskHistory.json"
+        ).exists()
 
-    def _task_history(self) -> list[dict]:
-        try:
-            data = json.loads((self.BASE / "state" / "taskHistory.json").read_text())
-        except (json.JSONDecodeError, OSError):
-            return []
-        return data if isinstance(data, list) else []
+    # -- session loading (merged, oldest first) --
+
+    def _sessions(self) -> list[dict]:
+        sessions = self._new_sessions()
+        for sid, row in self._legacy_sessions().items():
+            sessions.setdefault(sid, row)
+        return sorted(sessions.values(), key=lambda s: s["ts"] or 0)
 
     @staticmethod
-    def _task_workspace(task: dict) -> str:
-        return task.get("cwdOnTaskInitialization") or ""
+    def _iso_to_ms(value: object) -> float | None:
+        """Parse an ISO timestamp (possibly 'Z'-suffixed) to epoch ms."""
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000
+        except ValueError:
+            return None
+
+    def _new_sessions(self) -> dict[str, dict]:
+        """Sessions from ~/.cline/data (Cline >= 4)."""
+        db = self.DATA / "db" / "sessions.db"
+        if not db.exists():
+            return {}
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            rows = con.execute(
+                "SELECT session_id, model, cwd, workspace_root, started_at,"
+                " metadata_json, messages_path FROM sessions"
+            ).fetchall()
+            con.close()
+        except sqlite3.Error:
+            return {}
+
+        out: dict[str, dict] = {}
+        for sid, model, cwd, ws_root, started_at, mjson, mpath in rows:
+            try:
+                md = json.loads(mjson or "{}")
+            except json.JSONDecodeError:
+                md = {}
+            out[sid] = {
+                "id": sid,
+                "title": str(md.get("title") or sid),
+                "ts": self._iso_to_ms(started_at),
+                "workspace": ws_root or cwd or "",
+                "model": model or "unknown",
+                "messages_path": Path(mpath) if mpath else self._new_messages_path(sid),
+                "history_path": None,
+                "per_request": self._new_per_request(sid, mpath),
+                "task_totals": None,
+            }
+        return out
+
+    def _new_messages_path(self, sid: str) -> Path:
+        return self.DATA / "sessions" / sid / f"{sid}.messages.json"
+
+    def _new_per_request(self, sid: str, mpath: str | None) -> list[dict]:
+        """Per-request usage from a session's .messages.json metrics."""
+        path = Path(mpath) if mpath else self._new_messages_path(sid)
+        try:
+            data = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return []
+        messages = data.get("messages", []) if isinstance(data, dict) else []
+        reqs: list[dict] = []
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            met = m.get("metrics")
+            if not isinstance(met, dict):
+                continue
+            inp = int(met.get("inputTokens") or 0)
+            cr = int(met.get("cacheReadTokens") or 0)
+            cw = int(met.get("cacheWriteTokens") or 0)
+            cost = met.get("cost")
+            reqs.append(
+                {
+                    "ts": int(m.get("ts") or 0),
+                    # inputTokens includes cached tokens; report non-cached input
+                    "input": max(inp - cr - cw, 0),
+                    "output": int(met.get("outputTokens") or 0),
+                    "cache_write": cw,
+                    "cache_read": cr,
+                    "cost": (
+                        float(cost)
+                        if isinstance(cost, (int, float)) and cost is not None
+                        else None
+                    ),
+                }
+            )
+        return reqs
+
+    def _legacy_sessions(self) -> dict[str, dict]:
+        """Tasks from the legacy extension storage (older Cline versions)."""
+        try:
+            data = json.loads((self.LEGACY / "state" / "taskHistory.json").read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+        if not isinstance(data, list):
+            return {}
+
+        out: dict[str, dict] = {}
+        for task in data:
+            tid = str(task.get("id") or "")
+            if not tid:
+                continue
+            deleted = bool(task.get("conversationHistoryDeletedRange"))
+            per_request = self._legacy_per_request(tid)
+            if deleted:
+                per_request = []
+            totals = None
+            if not per_request:
+                totals = (
+                    int(task.get("tokensIn") or 0),
+                    int(task.get("tokensOut") or 0),
+                    int(task.get("cacheWrites") or 0),
+                    int(task.get("cacheReads") or 0),
+                    task.get("totalCost"),
+                )
+            ts = task.get("ts")
+            out[tid] = {
+                "id": tid,
+                "title": str(task.get("task") or tid),
+                "ts": float(ts) if isinstance(ts, (int, float)) else None,
+                "workspace": task.get("cwdOnTaskInitialization") or "",
+                "model": task.get("modelId") or "unknown",
+                "messages_path": None,
+                "history_path": self.LEGACY / "tasks" / tid / "api_conversation_history.json",
+                "per_request": per_request,
+                "task_totals": totals,
+            }
+        return out
+
+    def _legacy_per_request(self, task_id: str) -> list[dict]:
+        """Per-request usage from a legacy task's ui_messages.json."""
+        path = self.LEGACY / "tasks" / task_id / "ui_messages.json"
+        try:
+            msgs = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return []
+        if not isinstance(msgs, list):
+            return []
+        reqs: list[dict] = []
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            if m.get("type") != "say" or m.get("say") != "api_req_started":
+                continue
+            try:
+                u = json.loads(m.get("text") or "{}")
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(u, dict) or "tokensIn" not in u:
+                continue
+            cost = u.get("cost")
+            reqs.append(
+                {
+                    "ts": int(m.get("ts") or 0),
+                    "input": int(u.get("tokensIn") or 0),  # already excludes cache
+                    "output": int(u.get("tokensOut") or 0),
+                    "cache_write": int(u.get("cacheWrites") or 0),
+                    "cache_read": int(u.get("cacheReads") or 0),
+                    "cost": (
+                        float(cost)
+                        if isinstance(cost, (int, float)) and cost is not None
+                        else None
+                    ),
+                }
+            )
+        return reqs
 
     @staticmethod
     def _ts_label(ts: object) -> str:
-        """Format an epoch-ms timestamp defensively (bogus values → '')."""
+        """Format an epoch-ms timestamp defensively (bogus values -> '')."""
         try:
             return ts_epoch_to_local(int(ts) / 1000)  # type: ignore[arg-type]
         except (TypeError, ValueError, OSError, OverflowError):
             return ""
 
-    def _load_history(self, task_id: str) -> list[dict]:
-        path = self.BASE / "tasks" / task_id / "api_conversation_history.json"
+    def _load_messages(self, session: dict) -> list[dict]:
+        """Raw message entries for a session (same shape in both formats)."""
+        path = session.get("messages_path") or session.get("history_path")
+        if path is None:
+            return []
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(Path(path).read_text())
         except (json.JSONDecodeError, OSError):
             return []
+        if isinstance(data, dict):
+            data = data.get("messages", [])
         return data if isinstance(data, list) else []
 
-    def _conversation_from_task(self, task: dict) -> Conversation:
-        tid = str(task.get("id") or "")
-        date = self._ts_label(task.get("ts")) or "unknown"
+    def _session_by_id(self, session_id: str) -> dict | None:
+        for session in self._sessions():
+            if session["id"] == session_id:
+                return session
+        return None
+
+    def _conversation_from_session(self, session: dict) -> Conversation:
         return Conversation(
-            id=tid,
+            id=session["id"],
             source=self.name,
-            title=str(task.get("task") or tid),
-            date=date,
-            message_count=len(self._load_history(tid)),
-            workspace=self._task_workspace(task),
+            title=session["title"],
+            date=self._ts_label(session["ts"]) or "unknown",
+            message_count=len(self._load_messages(session)),
+            workspace=session["workspace"],
         )
+
 
     @staticmethod
     def _message_parts(msg: dict) -> list[tuple[str, str]]:
-        """Flatten an API conversation entry into (kind, text) parts.
+        """Flatten a message entry into (kind, text) parts.
 
         kind is "text", "thinking", "tool_use" or "tool_result".
         """
@@ -1182,8 +1361,8 @@ class VSCodeBackend(Backend):
 
     def list_workspaces(self) -> dict[str, int]:
         counts: dict[str, int] = {}
-        for task in self._task_history():
-            ws = self._task_workspace(task)
+        for session in self._sessions():
+            ws = session["workspace"]
             if ws:
                 counts[ws] = counts.get(ws, 0) + 1
         return counts
@@ -1191,13 +1370,13 @@ class VSCodeBackend(Backend):
     def list_conversations(
         self, *, workspace: str | None = None
     ) -> list[Conversation]:
-        tasks = self._task_history()
+        sessions = self._sessions()
         if workspace:
             resolved = self.resolve_workspace(workspace, self.list_workspaces())
             if not resolved:
                 return []
-            tasks = [t for t in tasks if self._task_workspace(t) == resolved]
-        return [self._conversation_from_task(t) for t in tasks]
+            sessions = [s for s in sessions if s["workspace"] == resolved]
+        return [self._conversation_from_session(s) for s in sessions]
 
     def search(
         self,
@@ -1207,22 +1386,21 @@ class VSCodeBackend(Backend):
         thinking_only: bool = False,
         text_only: bool = False,
     ) -> dict[str, list[SearchHit]]:
-        tasks = self._task_history()
+        sessions = self._sessions()
         if workspace:
             resolved = self.resolve_workspace(workspace, self.list_workspaces())
-            tasks = (
-                [t for t in tasks if self._task_workspace(t) == resolved]
+            sessions = (
+                [s for s in sessions if s["workspace"] == resolved]
                 if resolved
                 else []
             )
 
         results: dict[str, list[SearchHit]] = {}
-        for task in tasks:
-            tid = str(task.get("id") or "")
-            conv = self._conversation_from_task(task)
+        for session in sessions:
+            conv = self._conversation_from_session(session)
             hits: list[SearchHit] = []
 
-            for msg in self._load_history(tid):
+            for msg in self._load_messages(session):
                 role = msg.get("role", "unknown")
                 timestamp = self._ts_label(msg.get("ts"))
                 for source_type, content in self._message_parts(msg):
@@ -1244,12 +1422,17 @@ class VSCodeBackend(Backend):
                             )
                         )
             if hits:
-                results[tid] = hits
+                results[session["id"]] = hits
         return results
 
+
     def get_messages(self, conversation_id: str) -> list[Message]:
+        session = self._session_by_id(conversation_id)
+        if session is None:
+            return []
+
         messages: list[Message] = []
-        for msg in self._load_history(conversation_id):
+        for msg in self._load_messages(session):
             role = msg.get("role", "unknown")
             timestamp = self._ts_label(msg.get("ts"))
 

@@ -105,7 +105,9 @@ A unified CLI for searching, listing, and exporting conversations from
 AI coding agents. Auto-detects which tools are installed and queries all
 of them by default.
 
-**Supported backends:** Cursor, Devin/Windsurf, Claude Code, VS Code (Cline)
+**Supported backends:** Cursor, Devin/Windsurf, Claude Code, VS Code (Cline).
+Cline sessions are read from `~/.cline/data` (Cline >= 4) and merged with
+the older VS Code extension storage.
 
 ```
 ai-conversations list                         # list all conversations
@@ -150,7 +152,9 @@ running Claude models through Cursor.
 
 Cline records per-request token counts and real USD costs (as reported by
 the API provider — actual money when routed through OpenRouter), so its
-costs are actual, not estimated.
+costs are actual, not estimated. Its data lives in `~/.cline/data`
+(Cline >= 4); older sessions from the VS Code extension storage are
+included too.
 
 ```
 ai-costs                                  # daily report, all sources

@@ -10,6 +10,8 @@ costs are calculated from tokens × API rates.
 
 Cline in VS Code records per-request token counts and real USD costs (as
 reported by the API provider — actual money when routed through OpenRouter).
+Its data lives in ``~/.cline/data`` (Cline >= 4) and, for older sessions,
+the VS Code extension's global storage; both are read and merged.
 
 Usage examples:
     ai-costs                              Daily report (all available sources)
@@ -772,47 +774,213 @@ class DevinBackend(UsageBackend):
 
 
 class VSCodeBackend(UsageBackend):
-    """Read token usage and real costs from Cline, the VS Code extension.
+    """Read token usage and real costs from Cline (VS Code).
 
-    Cline stores data in
-    ``~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev``:
+    Reads two on-disk formats, merged and deduped by session id:
 
-    - ``state/taskHistory.json`` — one record per task with cumulative
-      tokens (``tokensIn``/``tokensOut``/``cacheReads``/``cacheWrites``),
-      ``totalCost``, workspace (``cwdOnTaskInitialization``) and the
-      OpenRouter model slug (``modelId``).
-    - ``tasks/<id>/ui_messages.json`` — one ``api_req_started`` record per
-      API request with per-request tokens and the USD cost as reported by
-      the provider.
+    - Current (Cline >= 4): ``~/.cline/data`` — ``db/sessions.db`` session
+      index plus ``sessions/<id>/<id>.messages.json``, whose assistant
+      messages carry per-request ``metrics`` (tokens and the real USD cost
+      reported by the API provider — actual money when routed through
+      OpenRouter, cost_kind "actual").
+    - Legacy (older extension versions):
+      ``globalStorage/saoudrizwan.claude-dev`` — ``state/taskHistory.json``
+      (task-level token/cost totals) plus per-task
+      ``tasks/<id>/ui_messages.json`` (per-request records). Tasks whose
+      message history was partially deleted fall back to task-level totals.
 
-    When Cline is configured with OpenRouter as provider, those per-request
-    costs are real money actually billed (cost_kind "actual") — like Claude
-    Code, not like the counterfactual Cursor estimates. Tasks whose message
-    history was partially deleted (``conversationHistoryDeletedRange``) fall
-    back to the task-level totals from taskHistory.json, since the per-request
-    records on disk would undercount usage.
-
-    Note: Cline's ``tokensIn`` excludes cached tokens, which are tracked
-    separately in ``cacheReads``/``cacheWrites`` — the same split the tool
-    uses elsewhere, so totals stay additive without double counting.
+    Note: in the current format ``metrics.inputTokens`` includes cached
+    tokens (input − cacheReads − cacheWrites equals the session metadata's
+    ``tokensIn``); the legacy format's ``tokensIn`` already excludes them.
+    Both are normalized to non-cached input, matching the tool's additive
+    input/output/cache fields. Session-level token metadata is deliberately
+    not used — it goes stale for sessions that end abnormally — while
+    per-message metrics always reconcile with the recorded cost.
     """
 
     name = "vscode"
 
-    BASE = (
+    DATA = Path.home() / ".cline/data"
+    LEGACY = (
         Path.home()
         / "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev"
     )
 
     def is_available(self) -> bool:
-        return (self.BASE / "state" / "taskHistory.json").exists()
+        return (self.DATA / "db" / "sessions.db").exists() or (
+            self.LEGACY / "state" / "taskHistory.json"
+        ).exists()
 
-    def _task_history(self) -> list[dict]:
+    # -- session loading (merged, oldest first) --
+
+    def _sessions(self) -> list[dict]:
+        sessions = self._new_sessions()
+        for sid, row in self._legacy_sessions().items():
+            sessions.setdefault(sid, row)
+        return sorted(sessions.values(), key=lambda s: s["ts"] or 0)
+
+    @staticmethod
+    def _iso_to_ms(value: object) -> float | None:
+        """Parse an ISO timestamp (possibly 'Z'-suffixed) to epoch ms."""
+        if not isinstance(value, str) or not value:
+            return None
         try:
-            data = json.loads((self.BASE / "state" / "taskHistory.json").read_text())
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000
+        except ValueError:
+            return None
+
+    def _new_sessions(self) -> dict[str, dict]:
+        """Sessions from ~/.cline/data (Cline >= 4)."""
+        db = self.DATA / "db" / "sessions.db"
+        if not db.exists():
+            return {}
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            rows = con.execute(
+                "SELECT session_id, model, cwd, workspace_root, started_at,"
+                " metadata_json, messages_path FROM sessions"
+            ).fetchall()
+            con.close()
+        except sqlite3.Error:
+            return {}
+
+        out: dict[str, dict] = {}
+        for sid, model, cwd, ws_root, started_at, mjson, mpath in rows:
+            try:
+                md = json.loads(mjson or "{}")
+            except json.JSONDecodeError:
+                md = {}
+            out[sid] = {
+                "id": sid,
+                "title": str(md.get("title") or sid),
+                "ts": self._iso_to_ms(started_at),
+                "workspace": ws_root or cwd or "",
+                "model": model or "unknown",
+                "messages_path": Path(mpath) if mpath else self._new_messages_path(sid),
+                "history_path": None,
+                "per_request": self._new_per_request(sid, mpath),
+                "task_totals": None,
+            }
+        return out
+
+    def _new_messages_path(self, sid: str) -> Path:
+        return self.DATA / "sessions" / sid / f"{sid}.messages.json"
+
+    def _new_per_request(self, sid: str, mpath: str | None) -> list[dict]:
+        """Per-request usage from a session's .messages.json metrics."""
+        path = Path(mpath) if mpath else self._new_messages_path(sid)
+        try:
+            data = json.loads(path.read_text())
         except (json.JSONDecodeError, OSError):
             return []
-        return data if isinstance(data, list) else []
+        messages = data.get("messages", []) if isinstance(data, dict) else []
+        reqs: list[dict] = []
+        for m in messages:
+            if not isinstance(m, dict):
+                continue
+            met = m.get("metrics")
+            if not isinstance(met, dict):
+                continue
+            inp = int(met.get("inputTokens") or 0)
+            cr = int(met.get("cacheReadTokens") or 0)
+            cw = int(met.get("cacheWriteTokens") or 0)
+            cost = met.get("cost")
+            reqs.append(
+                {
+                    "ts": int(m.get("ts") or 0),
+                    # inputTokens includes cached tokens; report non-cached input
+                    "input": max(inp - cr - cw, 0),
+                    "output": int(met.get("outputTokens") or 0),
+                    "cache_write": cw,
+                    "cache_read": cr,
+                    "cost": (
+                        float(cost)
+                        if isinstance(cost, (int, float)) and cost is not None
+                        else None
+                    ),
+                }
+            )
+        return reqs
+
+    def _legacy_sessions(self) -> dict[str, dict]:
+        """Tasks from the legacy extension storage (older Cline versions)."""
+        try:
+            data = json.loads((self.LEGACY / "state" / "taskHistory.json").read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+        if not isinstance(data, list):
+            return {}
+
+        out: dict[str, dict] = {}
+        for task in data:
+            tid = str(task.get("id") or "")
+            if not tid:
+                continue
+            deleted = bool(task.get("conversationHistoryDeletedRange"))
+            per_request = self._legacy_per_request(tid)
+            if deleted:
+                per_request = []
+            totals = None
+            if not per_request:
+                totals = (
+                    int(task.get("tokensIn") or 0),
+                    int(task.get("tokensOut") or 0),
+                    int(task.get("cacheWrites") or 0),
+                    int(task.get("cacheReads") or 0),
+                    task.get("totalCost"),
+                )
+            ts = task.get("ts")
+            out[tid] = {
+                "id": tid,
+                "title": str(task.get("task") or tid),
+                "ts": float(ts) if isinstance(ts, (int, float)) else None,
+                "workspace": task.get("cwdOnTaskInitialization") or "",
+                "model": task.get("modelId") or "unknown",
+                "messages_path": None,
+                "history_path": None,
+                "per_request": per_request,
+                "task_totals": totals,
+            }
+        return out
+
+    def _legacy_per_request(self, task_id: str) -> list[dict]:
+        """Per-request usage from a legacy task's ui_messages.json."""
+        path = self.LEGACY / "tasks" / task_id / "ui_messages.json"
+        try:
+            msgs = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return []
+        if not isinstance(msgs, list):
+            return []
+        reqs: list[dict] = []
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            if m.get("type") != "say" or m.get("say") != "api_req_started":
+                continue
+            try:
+                u = json.loads(m.get("text") or "{}")
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(u, dict) or "tokensIn" not in u:
+                continue
+            cost = u.get("cost")
+            reqs.append(
+                {
+                    "ts": int(m.get("ts") or 0),
+                    "input": int(u.get("tokensIn") or 0),  # already excludes cache
+                    "output": int(u.get("tokensOut") or 0),
+                    "cache_write": int(u.get("cacheWrites") or 0),
+                    "cache_read": int(u.get("cacheReads") or 0),
+                    "cost": (
+                        float(cost)
+                        if isinstance(cost, (int, float)) and cost is not None
+                        else None
+                    ),
+                }
+            )
+        return reqs
+
 
     @staticmethod
     def _matches_workspace(query: str, cwd: str) -> bool:
@@ -827,29 +995,6 @@ class VSCodeBackend(UsageBackend):
         except (TypeError, ValueError, OSError, OverflowError):
             return "unknown"
 
-    def _per_request_usage(self, task_id: str) -> list[tuple[int, dict]]:
-        """Return [(ts_ms, usage_dict)] for each API request in a task."""
-        path = self.BASE / "tasks" / task_id / "ui_messages.json"
-        try:
-            msgs = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
-            return []
-        out: list[tuple[int, dict]] = []
-        if not isinstance(msgs, list):
-            return out
-        for m in msgs:
-            if not isinstance(m, dict):
-                continue
-            if m.get("type") != "say" or m.get("say") != "api_req_started":
-                continue
-            try:
-                usage = json.loads(m.get("text") or "{}")
-            except json.JSONDecodeError:
-                continue
-            if isinstance(usage, dict) and "tokensIn" in usage:
-                out.append((m.get("ts") or 0, usage))
-        return out
-
     def load_entries(
         self,
         *,
@@ -859,73 +1004,60 @@ class VSCodeBackend(UsageBackend):
         resolved_ws = str(Path(workspace).expanduser().resolve()) if workspace else None
 
         entries: list[UsageEntry] = []
-        for task in self._task_history():
-            task_id = str(task.get("id") or "")
-            if not task_id:
-                continue
-            cwd = task.get("cwdOnTaskInitialization") or ""
+        for session in self._sessions():
+            cwd = session["workspace"]
             if resolved_ws and not self._matches_workspace(resolved_ws, cwd):
                 continue
 
-            model = task.get("modelId") or "unknown"
-            task_date = self._safe_date(task.get("ts"))
+            model = session["model"]
+            session_date = self._safe_date(session["ts"]) if session["ts"] else "unknown"
 
-            # Prefer per-request records; fall back to task-level totals when
-            # the message history was deleted (or is missing) because the
-            # remaining per-request records would undercount real usage.
-            deleted = bool(task.get("conversationHistoryDeletedRange"))
-            per_request = self._per_request_usage(task_id)
-
-            if per_request and not deleted:
-                for ts_ms, u in per_request:
-                    inp = int(u.get("tokensIn") or 0)
-                    out = int(u.get("tokensOut") or 0)
-                    cw = int(u.get("cacheWrites") or 0)
-                    cr = int(u.get("cacheReads") or 0)
+            # Per-request metrics are preferred (they always reconcile with
+            # the recorded cost); fall back to task-level totals only for
+            # legacy tasks whose message history was deleted or is missing.
+            per_request = session["per_request"]
+            if per_request:
+                for r in per_request:
+                    inp = r["input"]
+                    out = r["output"]
+                    cw = r["cache_write"]
+                    cr = r["cache_read"]
                     if inp + out + cw + cr == 0:
                         continue
-                    cost = u.get("cost")
-                    has_cost = isinstance(cost, (int, float)) and cost is not None
+                    cost = r["cost"]
+                    has_cost = cost is not None
                     entries.append(
                         UsageEntry(
                             source=self.name,
-                            date=(
-                                self._safe_date(ts_ms)
-                                if ts_ms
-                                else task_date
-                            ),
+                            date=self._safe_date(r["ts"]) if r["ts"] else session_date,
                             model=model,
                             input_tokens=inp,
                             output_tokens=out,
                             cache_create_tokens=cw,
                             cache_read_tokens=cr,
-                            cost_usd=float(cost) if has_cost else None,
+                            cost_usd=cost if has_cost else None,
                             cost_kind="actual" if has_cost else "calculated",
-                            session_id=task_id,
+                            session_id=session["id"],
                             workspace=cwd,
                         )
                     )
-            else:
-                inp = int(task.get("tokensIn") or 0)
-                out = int(task.get("tokensOut") or 0)
-                cw = int(task.get("cacheWrites") or 0)
-                cr = int(task.get("cacheReads") or 0)
+            elif session["task_totals"]:
+                inp, out, cw, cr, cost = session["task_totals"]
                 if inp + out + cw + cr == 0:
                     continue
-                total = task.get("totalCost")
-                has_cost = isinstance(total, (int, float)) and total is not None
+                has_cost = isinstance(cost, (int, float)) and cost is not None
                 entries.append(
                     UsageEntry(
                         source=self.name,
-                        date=task_date,
+                        date=session_date,
                         model=model,
                         input_tokens=inp,
                         output_tokens=out,
                         cache_create_tokens=cw,
                         cache_read_tokens=cr,
-                        cost_usd=float(total) if has_cost else None,
+                        cost_usd=float(cost) if has_cost else None,
                         cost_kind="actual" if has_cost else "calculated",
-                        session_id=task_id,
+                        session_id=session["id"],
                         workspace=cwd,
                     )
                 )
