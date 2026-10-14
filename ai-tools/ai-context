@@ -3,32 +3,49 @@
 
 Ingests exported AI conversations (from ai-conversations export), sends them
 through an LLM for structured extraction, and stores the results in a local
-SQLite database.  Entries are categorised as Decisions, Discoveries, State, or
-Contacts, and are queryable by project, category, date, and free text.
+SQLite database.  Entries are queryable by project, category, date, and free
+text.
+
+Two database layers:
+  - **Project DB** at `<project-root>/.ai-context/bitacora.db` — project-specific
+    knowledge (decisions, discoveries, architecture, etc.).  Auto-detected by
+    walking up from CWD looking for `.git/` or `.ai-context/`.
+  - **Global DB** at `~/.local/share/ai-context/bitacora.db` — cross-project
+    knowledge (contacts, preferences, general patterns).
+
+Categories are dynamic and grow per project.  Default seed categories are
+decision, discovery, state, and contact, but the LLM can propose new ones
+(e.g. "architecture", "deployment", "debugging") and they are registered
+automatically.
 
 The LLM step can use Anthropic (Claude) or OpenRouter (open-source models).
 Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY accordingly.
 
 Usage examples:
-    ai-context ingest exported/                   Ingest all markdown exports
-    ai-context ingest exported/20261013_devin_*.md  Ingest specific files
+    ai-context ingest exported/                   Ingest into project DB
+    ai-context ingest --global exported/           Ingest into global DB
     ai-context ingest --auto                      Export + ingest in one step
     ai-context ingest --auto -w ~/work/PSA        Auto-ingest for a workspace
 
-    ai-context query "credstore"                  Full-text search
+    ai-context init                               Create .ai-context/ in project root
+
+    ai-context query "credstore"                  Search project + global
     ai-context query --category decision          Filter by category
     ai-context query --project cyber-psa          Filter by project
-    ai-context query --since 2026-10-01           Date filter
+    ai-context query --global-only                Search global DB only
 
-    ai-context show 42                            Show entry details
-    ai-context stats                              Summary of the database
+    ai-context show 42                            Show entry details (project DB)
+    ai-context show --global 42                   Show entry details (global DB)
+
+    ai-context categories                         List categories in current DB
+    ai-context stats                              Summary of both databases
 
     ai-context providers                          Show available LLM providers
 
 Options:
     --provider anthropic|openrouter       LLM provider (default: auto-detect from keys)
     --model MODEL                         Model name (default: provider-specific)
-    --db PATH                             Database path (default: ~/.local/share/ai-context/bitacora.db)
+    --global                              Use the global DB instead of project DB
     --dry-run                             Show what would be ingested, don't call LLM
 """
 
@@ -53,13 +70,19 @@ from pathlib import Path
 
 # ── Data model ────────────────────────────────────────────────────────────────
 
-CATEGORIES = ("decision", "discovery", "state", "contact")
+SEED_CATEGORIES = {
+    "decision": "A choice that was made, with rationale and alternatives considered",
+    "discovery": "Codebase or infrastructure knowledge that is expensive to re-learn",
+    "state": "In-flight work, blockers, branch status, deployment info",
+    "contact": "People, roles, team dynamics, ownership",
+}
+
 
 @dataclass
 class Entry:
     id: int | None
-    category: str           # decision | discovery | state | contact
-    project: str            # e.g. "cyber-psa-backend", "ergonomics", "gears-rust"
+    category: str           # dynamic — any registered category
+    project: str            # e.g. "cyber-psa-backend", "ergonomics"
     title: str              # short summary
     content: str            # full detail
     tags: list[str] = field(default_factory=list)
@@ -71,12 +94,19 @@ class Entry:
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
-DEFAULT_DB = Path.home() / ".local/share/ai-context/bitacora.db"
+GLOBAL_DB = Path.home() / ".local/share/ai-context/bitacora.db"
+PROJECT_DIR_NAME = ".ai-context"
+PROJECT_DB_NAME = "bitacora.db"
 
 SCHEMA_SQL = """\
+CREATE TABLE IF NOT EXISTS categories (
+    name        TEXT PRIMARY KEY,
+    description TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS entries (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    category          TEXT NOT NULL CHECK (category IN ('decision', 'discovery', 'state', 'contact')),
+    category          TEXT NOT NULL REFERENCES categories(name),
     project           TEXT NOT NULL DEFAULT '',
     title             TEXT NOT NULL,
     content           TEXT NOT NULL,
@@ -95,27 +125,27 @@ CREATE TABLE IF NOT EXISTS ingestion_log (
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
-    title, content, tags, project,
+    title, content, tags, project, category,
     content='entries',
     content_rowid='id'
 );
 
 -- Triggers to keep FTS in sync
 CREATE TRIGGER IF NOT EXISTS entries_ai AFTER INSERT ON entries BEGIN
-    INSERT INTO entries_fts(rowid, title, content, tags, project)
-    VALUES (new.id, new.title, new.content, new.tags, new.project);
+    INSERT INTO entries_fts(rowid, title, content, tags, project, category)
+    VALUES (new.id, new.title, new.content, new.tags, new.project, new.category);
 END;
 
 CREATE TRIGGER IF NOT EXISTS entries_ad AFTER DELETE ON entries BEGIN
-    INSERT INTO entries_fts(entries_fts, rowid, title, content, tags, project)
-    VALUES ('delete', old.id, old.title, old.content, old.tags, old.project);
+    INSERT INTO entries_fts(entries_fts, rowid, title, content, tags, project, category)
+    VALUES ('delete', old.id, old.title, old.content, old.tags, old.project, old.category);
 END;
 
 CREATE TRIGGER IF NOT EXISTS entries_au AFTER UPDATE ON entries BEGIN
-    INSERT INTO entries_fts(entries_fts, rowid, title, content, tags, project)
-    VALUES ('delete', old.id, old.title, old.content, old.tags, old.project);
-    INSERT INTO entries_fts(rowid, title, content, tags, project)
-    VALUES (new.id, new.title, new.content, new.tags, new.project);
+    INSERT INTO entries_fts(entries_fts, rowid, title, content, tags, project, category)
+    VALUES ('delete', old.id, old.title, old.content, old.tags, old.project, old.category);
+    INSERT INTO entries_fts(rowid, title, content, tags, project, category)
+    VALUES (new.id, new.title, new.content, new.tags, new.project, new.category);
 END;
 """
 
@@ -125,9 +155,80 @@ def open_db(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=OFF")  # allow categories to be added on-the-fly
     conn.executescript(SCHEMA_SQL)
+    _seed_categories(conn)
     return conn
 
+
+def _seed_categories(conn: sqlite3.Connection) -> None:
+    """Ensure seed categories exist (idempotent)."""
+    for name, desc in SEED_CATEGORIES.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO categories (name, description) VALUES (?, ?)",
+            (name, desc),
+        )
+    conn.commit()
+
+
+def ensure_category(conn: sqlite3.Connection, name: str, description: str = "") -> None:
+    """Register a new category if it doesn't exist."""
+    conn.execute(
+        "INSERT OR IGNORE INTO categories (name, description) VALUES (?, ?)",
+        (name, description),
+    )
+    conn.commit()
+
+
+def list_categories(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT name, description, "
+        "(SELECT COUNT(*) FROM entries WHERE category = categories.name) as count "
+        "FROM categories ORDER BY count DESC, name"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Project root detection ────────────────────────────────────────────────────
+
+def find_project_root(start: Path | None = None) -> Path | None:
+    """Walk up from `start` looking for .ai-context/ or .git/.
+
+    Returns the project root directory, or None if nothing found.
+    Prefers .ai-context/ over .git/ (a project might have .ai-context
+    without being a git repo).
+    """
+    d = (start or Path.cwd()).resolve()
+    # First pass: look for .ai-context/
+    for parent in [d, *d.parents]:
+        if (parent / PROJECT_DIR_NAME).is_dir():
+            return parent
+    # Second pass: look for .git/
+    for parent in [d, *d.parents]:
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+def get_project_db_path(project_root: Path) -> Path:
+    return project_root / PROJECT_DIR_NAME / PROJECT_DB_NAME
+
+
+def resolve_db(args: argparse.Namespace) -> tuple[Path, str]:
+    """Return (db_path, label) based on --global flag and CWD.
+
+    Returns global DB if --global is set or no project root found.
+    """
+    if getattr(args, "use_global", False):
+        return GLOBAL_DB, "global"
+
+    root = find_project_root()
+    if root:
+        return get_project_db_path(root), f"project ({root.name})"
+    return GLOBAL_DB, "global"
+
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
 
 def file_hash(path: Path) -> str:
     h = hashlib.sha256()
@@ -151,6 +252,8 @@ def record_ingestion(conn: sqlite3.Connection, fhash: str, filename: str, count:
 def insert_entries(conn: sqlite3.Connection, entries: list[Entry]) -> int:
     inserted = 0
     for e in entries:
+        # Auto-register unknown categories
+        ensure_category(conn, e.category)
         conn.execute(
             """INSERT INTO entries (category, project, title, content, tags,
                source_session, source_tool, conversation_date)
@@ -173,32 +276,34 @@ def insert_entries(conn: sqlite3.Connection, entries: list[Entry]) -> int:
 
 # ── LLM providers ────────────────────────────────────────────────────────────
 
-CATEGORIZATION_PROMPT = """\
+def build_categorization_prompt(categories: list[dict]) -> str:
+    """Build the extraction prompt dynamically from registered categories."""
+    cat_lines = []
+    for i, cat in enumerate(categories, 1):
+        desc = cat["description"] or "No description"
+        cat_lines.append(f'{i}. **{cat["name"]}** — {desc}')
+
+    cat_block = "\n\n".join(cat_lines)
+
+    return f"""\
 You are a knowledge extraction assistant.  You read AI coding-assistant
 conversation transcripts and extract structured knowledge entries.
 
 For each conversation, extract entries in these categories:
 
-1. **decision** — A choice that was made, with rationale and alternatives
-   considered.  Examples: "chose library X over Y because ...",
-   "decided to use OData for filtering instead of custom query params".
+{cat_block}
 
-2. **discovery** — Codebase or infrastructure knowledge that is expensive to
-   re-learn.  Examples: "credstore 0.3.2 requires `database.servers` in
-   config", "the toolkit openapi `exposed` field controls gateway routing".
-
-3. **contact** — People, roles, team dynamics, ownership.  Examples:
-   "Alex is the PM for alert-automation", "PR reviewer insisted on squash".
-
-4. **state** — In-flight work, blockers, branch status, deployment info.
-   Examples: "deployed build 5bbe14790 to clients-200826",
-   "PLTFRM-95212 blocked on PM clarification of 'requires attention' query".
+You may also propose NEW categories if none of the above fit well.  When you
+do, include a "category_description" field explaining what the new category
+captures.  Good new categories are specific enough to be useful but general
+enough to accumulate multiple entries over time (e.g. "architecture",
+"deployment", "debugging", "pattern", "preference").
 
 Rules:
 - Extract ONLY substantive entries — skip greetings, meta-discussion, tool
   output noise, and trivial exchanges.
 - Each entry needs: category, project (infer from workspace/repo name),
-  a short title (≤80 chars), detailed content, and relevant tags.
+  a short title (<=80 chars), detailed content, and relevant tags.
 - For the project field, use the repository/project short name (e.g.
   "cyber-psa-backend", "ergonomics", "gears-rust").  If unclear, use "unknown".
 - Tags should be lowercase, specific terms (e.g. "odata", "deployment",
@@ -209,13 +314,21 @@ Rules:
 Return ONLY a JSON array of objects with these fields:
 ```json
 [
-  {
+  {{
     "category": "decision",
     "project": "cyber-psa-backend",
     "title": "Short title here",
     "content": "Detailed description of what was decided/discovered/etc.",
     "tags": ["tag1", "tag2"]
-  }
+  }},
+  {{
+    "category": "new_category_name",
+    "category_description": "What this new category captures",
+    "project": "...",
+    "title": "...",
+    "content": "...",
+    "tags": ["..."]
+  }}
 ]
 ```
 
@@ -237,17 +350,17 @@ DEFAULT_MODELS = {
 }
 
 
-def llm_extract(text: str, provider: str, model: str) -> list[dict]:
+def llm_extract(text: str, provider: str, model: str, prompt: str) -> list[dict]:
     """Send conversation text to LLM and get structured entries back."""
     if provider == "anthropic":
-        return _call_anthropic(text, model)
+        return _call_anthropic(text, model, prompt)
     elif provider == "openrouter":
-        return _call_openrouter(text, model)
+        return _call_openrouter(text, model, prompt)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
 
-def _call_anthropic(text: str, model: str) -> list[dict]:
+def _call_anthropic(text: str, model: str, prompt: str) -> list[dict]:
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         print("Error: ANTHROPIC_API_KEY not set.", file=sys.stderr)
@@ -256,7 +369,7 @@ def _call_anthropic(text: str, model: str) -> list[dict]:
     body = json.dumps({
         "model": model,
         "max_tokens": 8192,
-        "system": CATEGORIZATION_PROMPT,
+        "system": prompt,
         "messages": [{"role": "user", "content": text}],
     }).encode()
 
@@ -273,7 +386,7 @@ def _call_anthropic(text: str, model: str) -> list[dict]:
     return _do_request(req)
 
 
-def _call_openrouter(text: str, model: str) -> list[dict]:
+def _call_openrouter(text: str, model: str, prompt: str) -> list[dict]:
     api_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not api_key:
         print("Error: OPENROUTER_API_KEY not set.", file=sys.stderr)
@@ -283,7 +396,7 @@ def _call_openrouter(text: str, model: str) -> list[dict]:
         "model": model,
         "max_tokens": 8192,
         "messages": [
-            {"role": "system", "content": CATEGORIZATION_PROMPT},
+            {"role": "system", "content": prompt},
             {"role": "user", "content": text},
         ],
     }).encode()
@@ -430,6 +543,37 @@ def chunk_conversation(text: str, max_chars: int = 80_000) -> list[str]:
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
+def cmd_init(args: argparse.Namespace) -> None:
+    """Create .ai-context/ in the current project root."""
+    root = find_project_root()
+    if root and (root / PROJECT_DIR_NAME).is_dir():
+        print(f"Already initialised: {root / PROJECT_DIR_NAME}/")
+        conn = open_db(get_project_db_path(root))
+        cats = list_categories(conn)
+        conn.close()
+        print(f"Categories: {', '.join(c['name'] for c in cats)}")
+        return
+
+    # Use git root if found, otherwise CWD
+    target = root or Path.cwd()
+    ctx_dir = target / PROJECT_DIR_NAME
+    ctx_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create .gitignore inside .ai-context
+    gitignore = ctx_dir / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text("# Ignore the DB by default (personal knowledge)\nbitacora.db\nbitacora.db-wal\nbitacora.db-shm\n")
+
+    conn = open_db(get_project_db_path(target))
+    cats = list_categories(conn)
+    conn.close()
+
+    print(f"Initialised: {ctx_dir}/")
+    print(f"Seed categories: {', '.join(c['name'] for c in cats)}")
+    print(f"\nThe DB is gitignored by default. Remove the .gitignore entry")
+    print(f"to share project knowledge with the team.")
+
+
 def cmd_ingest(args: argparse.Namespace) -> None:
     provider = args.provider or detect_provider()
     if not provider and not args.dry_run:
@@ -445,7 +589,12 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         print("No files to ingest.")
         return
 
-    conn = open_db(Path(args.db))
+    db_path, db_label = resolve_db(args)
+    conn = open_db(db_path)
+
+    # Build prompt from current categories
+    cats = list_categories(conn)
+    prompt = build_categorization_prompt(cats)
 
     # Filter already-ingested
     new_files = []
@@ -460,9 +609,10 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         print("All files already ingested.")
         return
 
-    print(f"\nIngesting {len(new_files)} file(s) via {provider}/{model}\n")
+    print(f"\nIngesting {len(new_files)} file(s) into {db_label} DB via {provider}/{model}\n")
 
     total_entries = 0
+    new_cats = set()
     for fpath, fhash in new_files:
         text = fpath.read_text(encoding="utf-8", errors="replace")
         meta = parse_export_metadata(text)
@@ -477,7 +627,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
 
         all_raw_entries = []
         for i, chunk in enumerate(chunks):
-            raw = llm_extract(chunk, provider, model)
+            raw = llm_extract(chunk, provider, model, prompt)
             all_raw_entries.extend(raw)
             if len(chunks) > 1:
                 # Rate-limit between chunks
@@ -486,9 +636,18 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         # Convert to Entry objects
         entries = []
         for raw_entry in all_raw_entries:
-            cat = raw_entry.get("category", "").lower()
-            if cat not in CATEGORIES:
+            cat = raw_entry.get("category", "").lower().strip()
+            if not cat:
                 continue
+
+            # Register new categories proposed by the LLM
+            cat_desc = raw_entry.get("category_description", "")
+            existing = {c["name"] for c in cats}
+            if cat not in existing:
+                ensure_category(conn, cat, cat_desc)
+                new_cats.add(cat)
+                cats.append({"name": cat, "description": cat_desc, "count": 0})
+
             entries.append(Entry(
                 id=None,
                 category=cat,
@@ -507,7 +666,9 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         print(f" -> {count} entries")
 
     conn.close()
-    print(f"\nDone. {total_entries} entries added to the bitácora.")
+    print(f"\nDone. {total_entries} entries added to the bitácora ({db_label}).")
+    if new_cats:
+        print(f"New categories registered: {', '.join(sorted(new_cats))}")
 
 
 def _collect_input_files(args: argparse.Namespace) -> list[Path]:
@@ -537,7 +698,7 @@ def _auto_export(args: argparse.Namespace) -> list[Path]:
     if args.workspace:
         cmd.extend(["-w", args.workspace])
     if args.source:
-        cmd.extend(["--source", args.source])
+        cmd.extend(["-s", args.source])
 
     print(f"Auto-exporting conversations to {export_dir}/ ...")
     try:
@@ -556,11 +717,10 @@ def _auto_export(args: argparse.Namespace) -> list[Path]:
     return files
 
 
-def cmd_query(args: argparse.Namespace) -> None:
-    conn = open_db(Path(args.db))
-
-    if args.term:
-        # Full-text search
+def _query_db(conn: sqlite3.Connection, args: argparse.Namespace, label: str) -> list[dict]:
+    """Run a query against a single DB, return rows as dicts."""
+    term = getattr(args, "term", None)
+    if term:
         sql = """
             SELECT e.id, e.category, e.project, e.title,
                    e.conversation_date, e.source_tool, e.tags
@@ -568,7 +728,7 @@ def cmd_query(args: argparse.Namespace) -> None:
             JOIN entries e ON e.id = fts.rowid
             WHERE entries_fts MATCH ?
         """
-        params: list = [args.term]
+        params: list = [term]
     else:
         sql = """
             SELECT id, category, project, title,
@@ -593,39 +753,69 @@ def cmd_query(args: argparse.Namespace) -> None:
     sql += f" LIMIT {limit}"
 
     rows = conn.execute(sql, params).fetchall()
-    conn.close()
+    return [{"db": label, **dict(r)} for r in rows]
 
-    if not rows:
+
+def cmd_query(args: argparse.Namespace) -> None:
+    results = []
+    global_only = getattr(args, "global_only", False)
+    project_only = getattr(args, "project_only", False)
+
+    # Query project DB (if exists and not --global-only)
+    if not global_only:
+        root = find_project_root()
+        if root:
+            pdb = get_project_db_path(root)
+            if pdb.exists():
+                conn = open_db(pdb)
+                results.extend(_query_db(conn, args, f"project"))
+                conn.close()
+
+    # Query global DB (if not --project-only)
+    if not project_only and GLOBAL_DB.exists():
+        conn = open_db(GLOBAL_DB)
+        results.extend(_query_db(conn, args, "global"))
+        conn.close()
+
+    if not results:
         print("No entries found.")
         return
 
+    # Sort merged results by date desc
+    results.sort(key=lambda r: (r.get("conversation_date", ""), r.get("id", 0)), reverse=True)
+
+    limit = args.limit or 50
+    results = results[:limit]
+
     # Display
-    print(f"{'ID':>5}  {'Cat':10}  {'Project':20}  {'Date':12}  {'Source':8}  Title")
-    print("─" * 100)
-    for r in rows:
+    print(f"{'ID':>5}  {'DB':8}  {'Cat':12}  {'Project':20}  {'Date':12}  Title")
+    print("─" * 105)
+    for r in results:
         tags = json.loads(r["tags"]) if r["tags"] else []
         tag_str = f"  [{', '.join(tags[:3])}]" if tags else ""
         print(
-            f"{r['id']:>5}  {r['category']:10}  {r['project']:20}  "
-            f"{r['conversation_date']:12}  {r['source_tool']:8}  "
-            f"{r['title'][:60]}{tag_str}"
+            f"{r['id']:>5}  {r['db']:8}  {r['category']:12}  {r['project']:20}  "
+            f"{r['conversation_date']:12}  "
+            f"{r['title'][:55]}{tag_str}"
         )
 
-    if len(rows) == limit:
+    if len(results) == limit:
         print(f"\n(showing first {limit} — use --limit N for more)")
 
 
 def cmd_show(args: argparse.Namespace) -> None:
-    conn = open_db(Path(args.db))
+    db_path, db_label = resolve_db(args)
+    conn = open_db(db_path)
     row = conn.execute("SELECT * FROM entries WHERE id = ?", (args.entry_id,)).fetchone()
     conn.close()
 
     if not row:
-        print(f"Entry {args.entry_id} not found.")
+        print(f"Entry {args.entry_id} not found in {db_label} DB.")
         sys.exit(1)
 
     tags = json.loads(row["tags"]) if row["tags"] else []
     print(f"ID:         {row['id']}")
+    print(f"DB:         {db_label}")
     print(f"Category:   {row['category']}")
     print(f"Project:    {row['project']}")
     print(f"Title:      {row['title']}")
@@ -638,48 +828,94 @@ def cmd_show(args: argparse.Namespace) -> None:
 
 
 def cmd_stats(args: argparse.Namespace) -> None:
-    conn = open_db(Path(args.db))
+    found_any = False
+
+    # Project DB
+    root = find_project_root()
+    if root:
+        pdb = get_project_db_path(root)
+        if pdb.exists():
+            found_any = True
+            print(f"=== Project DB ({root.name}) ===\n")
+            _print_db_stats(pdb)
+
+    # Global DB
+    if GLOBAL_DB.exists():
+        if found_any:
+            print()
+        found_any = True
+        print(f"=== Global DB ===\n")
+        _print_db_stats(GLOBAL_DB)
+
+    if not found_any:
+        print("No databases found. Run `ai-context init` to create a project DB,")
+        print("or `ai-context ingest --global` to populate the global DB.")
+
+
+def _print_db_stats(db_path: Path) -> None:
+    conn = open_db(db_path)
 
     total = conn.execute("SELECT COUNT(*) as n FROM entries").fetchone()["n"]
     if total == 0:
-        print("The bitácora is empty. Run `ai-context ingest` to populate it.")
+        print("  Empty. Run `ai-context ingest` to populate it.")
+        conn.close()
         return
 
-    print(f"Total entries: {total}\n")
+    print(f"  Total entries: {total}")
 
     # By category
-    print("By category:")
+    print("\n  By category:")
     for row in conn.execute(
         "SELECT category, COUNT(*) as n FROM entries GROUP BY category ORDER BY n DESC"
     ):
-        print(f"  {row['category']:12} {row['n']:>5}")
+        print(f"    {row['category']:15} {row['n']:>5}")
 
     # By project
-    print("\nBy project:")
+    print("\n  By project:")
     for row in conn.execute(
         "SELECT project, COUNT(*) as n FROM entries GROUP BY project ORDER BY n DESC LIMIT 15"
     ):
-        print(f"  {row['project']:25} {row['n']:>5}")
+        print(f"    {row['project']:25} {row['n']:>5}")
 
     # By source tool
-    print("\nBy source:")
+    print("\n  By source:")
     for row in conn.execute(
         "SELECT source_tool, COUNT(*) as n FROM entries GROUP BY source_tool ORDER BY n DESC"
     ):
-        print(f"  {row['source_tool']:12} {row['n']:>5}")
+        print(f"    {row['source_tool']:12} {row['n']:>5}")
 
     # Date range
     date_range = conn.execute(
         "SELECT MIN(conversation_date) as mn, MAX(conversation_date) as mx FROM entries"
     ).fetchone()
     if date_range["mn"]:
-        print(f"\nDate range:  {date_range['mn']}  to  {date_range['mx']}")
+        print(f"\n  Date range:  {date_range['mn']}  to  {date_range['mx']}")
 
     # Ingestion log
     ingestions = conn.execute("SELECT COUNT(*) as n FROM ingestion_log").fetchone()["n"]
-    print(f"Files ingested: {ingestions}")
+    print(f"  Files ingested: {ingestions}")
+
+    # Categories
+    cats = list_categories(conn)
+    non_seed = [c for c in cats if c["name"] not in SEED_CATEGORIES]
+    if non_seed:
+        print(f"\n  Custom categories: {', '.join(c['name'] for c in non_seed)}")
 
     conn.close()
+
+
+def cmd_categories(args: argparse.Namespace) -> None:
+    db_path, db_label = resolve_db(args)
+    conn = open_db(db_path)
+    cats = list_categories(conn)
+    conn.close()
+
+    print(f"Categories in {db_label} DB:\n")
+    print(f"  {'Name':15}  {'Count':>5}  Description")
+    print("  " + "─" * 70)
+    for c in cats:
+        seed_marker = "" if c["name"] in SEED_CATEGORIES else " [custom]"
+        print(f"  {c['name']:15}  {c['count']:>5}  {c['description'][:50]}{seed_marker}")
 
 
 def cmd_providers(args: argparse.Namespace) -> None:
@@ -702,14 +938,14 @@ def cmd_providers(args: argparse.Namespace) -> None:
 
 def cmd_forget(args: argparse.Namespace) -> None:
     """Remove entries by ID or clear ingestion log for re-processing."""
-    conn = open_db(Path(args.db))
+    db_path, db_label = resolve_db(args)
+    conn = open_db(db_path)
 
     if args.entry_id:
         conn.execute("DELETE FROM entries WHERE id = ?", (args.entry_id,))
         conn.commit()
-        print(f"Deleted entry {args.entry_id}.")
+        print(f"Deleted entry {args.entry_id} from {db_label} DB.")
     elif args.file:
-        # Clear ingestion record so the file can be re-ingested
         fpath = Path(args.file)
         if fpath.exists():
             fh = file_hash(fpath)
@@ -717,7 +953,6 @@ def cmd_forget(args: argparse.Namespace) -> None:
             conn.commit()
             print(f"Cleared ingestion record for {fpath.name}. It will be re-processed on next ingest.")
         else:
-            # Try matching by filename
             conn.execute("DELETE FROM ingestion_log WHERE filename = ?", (args.file,))
             conn.commit()
             print(f"Cleared ingestion record for {args.file}.")
@@ -727,7 +962,7 @@ def cmd_forget(args: argparse.Namespace) -> None:
         conn.execute("DELETE FROM ingestion_log")
         conn.execute("DELETE FROM entries_fts")
         conn.commit()
-        print(f"Reset complete. Removed {count} entries and all ingestion records.")
+        print(f"Reset {db_label} DB. Removed {count} entries and all ingestion records.")
     else:
         print("Specify --id, --file, or --reset.")
 
@@ -742,11 +977,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Persistent AI context memory — the bitácora",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--db", default=str(DEFAULT_DB),
-        help=f"Database path (default: {DEFAULT_DB})",
-    )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    # init
+    sub.add_parser("init", help="Create .ai-context/ in the project root")
 
     # ingest
     p_ingest = sub.add_parser("ingest", help="Ingest conversation exports")
@@ -760,21 +994,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest.add_argument("--model", help="LLM model name")
     p_ingest.add_argument("--dry-run", action="store_true",
                           help="Show what would be ingested without calling LLM")
+    p_ingest.add_argument("--global", dest="use_global", action="store_true",
+                          help="Ingest into global DB instead of project DB")
 
     # query
     p_query = sub.add_parser("query", help="Search the bitácora")
     p_query.add_argument("term", nargs="?", help="Search term (FTS5 syntax)")
-    p_query.add_argument("--category", "-c", choices=CATEGORIES, help="Filter by category")
+    p_query.add_argument("--category", "-c", help="Filter by category")
     p_query.add_argument("--project", "-p", help="Filter by project name")
     p_query.add_argument("--since", help="Show entries from this date (YYYY-MM-DD)")
     p_query.add_argument("--limit", "-n", type=int, help="Max results (default: 50)")
+    p_query.add_argument("--global-only", action="store_true",
+                         help="Search global DB only")
+    p_query.add_argument("--project-only", action="store_true",
+                         help="Search project DB only")
 
     # show
     p_show = sub.add_parser("show", help="Show entry details")
     p_show.add_argument("entry_id", type=int, help="Entry ID")
+    p_show.add_argument("--global", dest="use_global", action="store_true",
+                        help="Show from global DB")
 
     # stats
     sub.add_parser("stats", help="Database statistics")
+
+    # categories
+    p_cats = sub.add_parser("categories", help="List registered categories")
+    p_cats.add_argument("--global", dest="use_global", action="store_true",
+                        help="Show global DB categories")
 
     # providers
     sub.add_parser("providers", help="Show available LLM providers")
@@ -783,7 +1030,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_forget = sub.add_parser("forget", help="Remove entries or reset ingestion")
     p_forget.add_argument("--id", dest="entry_id", type=int, help="Delete entry by ID")
     p_forget.add_argument("--file", help="Clear ingestion record for a file")
-    p_forget.add_argument("--reset", action="store_true", help="Reset entire database")
+    p_forget.add_argument("--reset", action="store_true", help="Reset database")
+    p_forget.add_argument("--global", dest="use_global", action="store_true",
+                          help="Operate on global DB")
 
     return parser
 
@@ -793,10 +1042,12 @@ def main() -> None:
     args = parser.parse_args()
 
     cmd_map = {
+        "init": cmd_init,
         "ingest": cmd_ingest,
         "query": cmd_query,
         "show": cmd_show,
         "stats": cmd_stats,
+        "categories": cmd_categories,
         "providers": cmd_providers,
         "forget": cmd_forget,
     }
