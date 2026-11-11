@@ -1,8 +1,3 @@
-# Ensure the completion script is loaded first
-if [ -f $(brew --prefix)/etc/bash_completion.d/git-completion.bash ]; then
-  source $(brew --prefix)/etc/bash_completion.d/git-completion.bash
-fi
-
 # Git aliases
 alias ga='git add'
 alias gb='git branch'
@@ -74,6 +69,17 @@ alias gr='git restore'
 alias grs='git restore --staged'
 alias gt='git tag'
 alias gts='git tag --sort=creatordate | tail -n 24'
+
+# Git completion for aliases
+# Ensure the completion script is loaded first
+if [ -f $(brew --prefix)/etc/bash_completion.d/git-completion.bash ]; then
+  source $(brew --prefix)/etc/bash_completion.d/git-completion.bash
+
+  # Call our autocompletion for git aliases script
+  if [ -f /usr/local/bin/git-alias-completion ]; then
+    source /usr/local/bin/git-alias-completion
+  fi
+fi
 
 # Cargo aliases
 alias cb='cargo fmt; cargo build'

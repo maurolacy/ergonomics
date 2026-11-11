@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+
+# 1. Ensure the core Git completion script is loaded first
+if [ -f "$(brew --prefix)/etc/bash_completion.d/git-completion.bash" ]; then
+    source "$(brew --prefix)/etc/bash_completion.d/git-completion.bash"
+fi
+
+# 2. Main execution block to prevent variable leakage into your shell scope
+if type __git_complete &>/dev/null; then
+    # Parse out your Git aliases from the current environment or specific config file
+    # (Note: Using 'alias' parses active memory. Change to 'cat ~/.bashrc' if running via a separate script)
+    alias | grep -E "alias g[a-z0-9_-]+='git " | while read -r line; do
+        
+        # Extract the alias name (e.g., gstashn)
+        alias_name=$(echo "$line" | sed -E "s/^alias //; s/=.*//")
+        
+        # Extract the immediate Git subcommand following 'git' (e.g., stash, commit, diff)
+        git_subcommand=$(echo "$line" | sed -E "s/.*='git ([a-z0-9-]+).*/\1/")
+
+        # Map standard subcommands to their internal completion functions
+        # Most match _git_<subcommand>, but checkout uses _git_checkout, etc.
+        case "$git_subcommand" in
+            checkout) comp_func="_git_checkout" ;;
+            switch)   comp_func="_git_switch" ;;
+            restore)  comp_func="_git_restore" ;;
+            *)        comp_func="_git_${git_subcommand}" ;;
+        esac
+
+        # Verify the target internal completion function exists before mapping it
+        if type "$comp_func" &>/dev/null; then
+            echo __git_complete "$alias_name" "$comp_func"
+            __git_complete "$alias_name" "$comp_func"
+        fi
+    done
+fi

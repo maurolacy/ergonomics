@@ -47,6 +47,12 @@ else
     echo "$LOCAL already sources base. Skipping."
 fi
 
+for tool in git-aliases-completion; do
+  target="/usr/local/bin/$tool"
+  ln -sf "$SCRIPT_DIR/$tool" "$target"
+  echo "Linked: $target -> $SCRIPT_DIR/$tool"
+done
+
 echo ""
 echo "To activate, either restart your shell or run:"
 echo "  source ~/.bash_aliases"
