@@ -1,3 +1,8 @@
+# Ensure the completion script is loaded first
+if [ -f $(brew --prefix)/etc/bash_completion.d/git-completion.bash ]; then
+  source $(brew --prefix)/etc/bash_completion.d/git-completion.bash
+fi
+
 # Git aliases
 alias ga='git add'
 alias gb='git branch'
@@ -7,7 +12,12 @@ alias gc='git commit'
 alias gcs='git commit --signoff'
 alias gcad='git commit -a --signoff'
 alias gcam='git commit --amend --signoff'
+# --- Modern Branching & Switching ---
 alias gcout='git checkout'
+alias gcoutb='git checkout -b'
+alias gsw='git switch'
+alias gswc='git switch -c'
+
 alias gf='git fetch'
 alias gfa='git fetch --all'
 alias gfo='git fetch origin'
@@ -16,18 +26,28 @@ alias gfpa='git fetch --all --prune'
 alias gfu='git fetch upstream'
 alias gl='git log'
 alias gln='git log --name-only'
+alias glg='git log --graph --oneline --decorate --all' # Visual branch graph
 alias gs='git status'
 alias gsi='git status --ignored'
 alias gsu='git status -u'
 alias gsui='git status -u --ignored'
+# --- Stash Management ---
 alias gstash='git stash'
-alias gstashn='git stash --keep-index'
+alias gstashn='git stash --keep-index -u'  # Stash only UNSTAGED changes
+alias gstasha='git stash apply'
+alias gstashp='git stash pop'
+alias gstashl='git stash list'
+alias gstashc='git stash clear'
+
+# --- Better Visibility (Diffs & Visual Logs) ---
 alias gd='git diff'
+alias gdc='git diff --cached'             # See what is actually staged
 alias gdh='git diff HEAD'
 alias gdhp='git diff HEAD^'
 alias gdn='git diff --name-only'
 alias gdnh='git diff --name-only HEAD'
 alias gdnhp='git diff --name-only HEAD^'
+
 alias gpull='git pull'
 alias gpullr='git pull --rebase'
 alias gpush='git push'
@@ -38,9 +58,16 @@ alias gpushf='git push --force-with-lease'
 alias gpushof='git push --force-with-lease --set-upstream origin HEAD'
 alias gpushmf='git push --force-with-lease --set-upstream mauro HEAD'
 alias gpushbf='git push --force-with-lease --set-upstream bechma HEAD'
+# --- Code Safeguards & Undos ---
 alias greset='git reset'
 alias greseth='git reset HEAD'
-alias gresethp='git reset HEAD^'
+alias gresethp='git reset --soft HEAD^'
+# --- Interactive Rebasing ---
+alias grb='git rebase'
+alias grbi='git rebase -i'
+alias grc='git rebase --continue'
+alias gra='git rebase --abort'
+
 alias grm='git rm'
 alias grmf='git rm -f'
 alias gr='git restore'
